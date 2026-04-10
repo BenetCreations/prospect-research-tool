@@ -1,0 +1,14 @@
+node_modules
+.env
+dist
+
+# Database (contains personal data)
+prospect.db
+prospect.db-shm
+prospect.db-wal
+
+# Seed files (contain personal data)
+seed_companies.json
+seed_contacts.json
+
+.DS_Store
