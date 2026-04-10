@@ -20,15 +20,15 @@ Built entirely with Claude Code (Anthropic's AI coding CLI) over the course of a
 
 **Dashboard view** — 22 companies sorted by tier and score, with tier counts in the header
 
-![Dashboard](screenshots/Screenshot%202026-04-10%20at%2011.11.29%20AM.jpeg)
+![Dashboard](screenshots/dashboard.jpeg)
 
 **Detail panel** — editing priority tier, scores, and contacts for a company
 
-![Detail panel](screenshots/Screenshot%202026-04-10%20at%2011.12.51%20AM.jpeg)
+![Detail panel](screenshots/detail-panel.jpeg)
 
 **Research workspace** — AI-generated brief for Stripe, streamed from the Claude API using live web search
 
-![Research](screenshots/Screenshot%202026-03-31%20at%209.18.33%20AM.jpeg)
+![Research](screenshots/research.jpeg)
 
 ---
 
