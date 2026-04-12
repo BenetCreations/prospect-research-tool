@@ -44,6 +44,64 @@ Built entirely with Claude Code (Anthropic's AI coding CLI) over the course of a
 
 ---
 
+## Dashboard
+
+The Dashboard is the home view — a responsive card grid of all tracked companies, sorted by priority tier (A → B → C) and then by composite score descending within each tier.
+
+### Company cards
+
+Each card shows:
+- **Company name and vertical/sector** — displayed in the card header
+- **Priority tier badge** — color-coded: emerald (Tier A), amber (Tier B), slate (Tier C); a matching color stripe runs across the top of the card
+- **Total composite score** — the sum of the four individual scores (Interest + Fit + Access + Timing), shown in the card footer
+- **Contact warmth dots** — one dot per contact linked to the company, colored by warmth (slate → teal → emerald → bright emerald for Cold/Warm/Hot/Strong), sorted warmest-first
+
+### Header stats
+
+The header row above the grid shows the total company count and a breakdown by tier (Tier A / Tier B / Tier C) as colored badge pills.
+
+### Adding companies
+
+The **Add Company** button in the top-right header opens a modal to create a new company record with name, vertical, and initial tier.
+
+### Detail panel
+
+Clicking any company card opens a right-side drawer for that company without leaving the dashboard:
+
+- **Priority tier** — three-button toggle (Tier A / B / C); changes are reflected immediately in the card grid
+- **Scores** — individual 1–5 pickers for Interest, Fit, Access, and Timing; the Total is computed live and displayed at the top
+- **Notes** — free-text field saved alongside scores
+- **Contacts** — per-company contact list showing name, title, and warmth; contacts can be added or edited inline with a warmth selector (Cold / Warm / Hot / Strong)
+- **Outreach history** — log of outreach entries for each contact, shown beneath the contact; new entries can be added directly from the panel
+
+All edits in the detail panel are saved explicitly with a Save button (scores/tier/notes) or per-action buttons (contacts/outreach).
+
+---
+
+## Research workspace
+
+The Research workspace is a focused two-pane view for generating and reviewing AI research briefs on target companies.
+
+### Sidebar
+
+The left sidebar lists all tracked companies sorted by tier then score — the same order as the dashboard. Each entry shows the company name, tier badge, and either the date of the last research run or "No research yet."
+
+### Running research
+
+Selecting a company and clicking **Run Research** sends a structured prompt to the Anthropic API with the `web_search` tool enabled. The server performs three targeted searches about the company:
+
+1. Their partnerships or business development org
+2. Their presence or hiring activity in the target region
+3. Recent news, momentum, or leadership signals
+
+The model synthesizes results into a structured brief and streams it back token-by-token via Server-Sent Events. The text renders progressively in the right pane as it arrives. Once complete, the brief is saved to the database and the sidebar updates with the current date.
+
+### Saved briefs
+
+Previously generated briefs load instantly when a company is selected — no re-run needed. The header shows when the last research was run. Clicking Run Research again overwrites the saved brief with a fresh one.
+
+---
+
 ## Postings tab
 
 The Postings tab turns the tool from a static snapshot into a passive job signal monitor. It polls the public [Greenhouse job board API](https://boards-api.greenhouse.io/v1/boards/{slug}/jobs) for each tracked company that uses Greenhouse as their ATS.
