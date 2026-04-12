@@ -8,6 +8,7 @@ dotenv.config({ path: join(__dirname, '../.env') });
 import express from 'express';
 import cors from 'cors';
 import Anthropic from '@anthropic-ai/sdk';
+import cron from 'node-cron';
 import { db, initDb } from './db/index.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -45,13 +46,53 @@ function rowToCompany(row) {
 
 function rowToContact(row) {
   return {
-    id:        row.id,
-    name:      row.name,
-    companyId: row.company_id,
-    title:     row.title,
-    warmth:    row.warmth,
+    id:          row.id,
+    name:        row.name,
+    companyId:   row.company_id,
+    companyName: row.company_name ?? null,
+    title:       row.title,
+    warmth:      row.warmth,
+    status:      row.status ?? 'Active',
+    nextAction:  row.next_action ?? '',
+    nextTouch:   row.next_touch ?? '',
+    lastTouch:   row.last_touch ?? null,
   };
 }
+
+function rowToOutreach(row) {
+  return {
+    id:          row.id,
+    contactId:   row.contact_id,
+    contactName: row.contact_name ?? null,
+    companyId:   row.company_id,
+    companyName: row.company_name ?? null,
+    date:        row.date,
+    action:      row.action ?? row.type ?? '',
+    notes:       row.notes ?? '',
+    result:      row.result ?? '',
+    createdAt:   row.created_at,
+  };
+}
+
+function rowToApplication(row) {
+  return {
+    id:           row.id,
+    jobPostingId: row.job_posting_id,
+    companyId:    row.company_id,
+    companyName:  row.company_name,
+    roleTitle:    row.role_title,
+    roleId:       row.role_id,
+    dateApplied:  row.date_applied,
+    referral:     row.referral === 1,
+    stage:        row.stage,
+    notes:        row.notes,
+    jobUrl:       row.job_url ?? null,
+    createdAt:    row.created_at,
+    updatedAt:    row.updated_at,
+  };
+}
+
+const VALID_STAGES = ['Drafting', 'Applied', 'Recruiter Screen', 'Hiring Manager', 'Interviewing', 'Final Round', 'Offer', 'Rejected'];
 
 // --- Company endpoints ---
 
@@ -110,6 +151,18 @@ app.patch('/api/companies/:id', (req, res) => {
 
 // --- Contact endpoints ---
 
+app.get('/api/contacts', (req, res) => {
+  const rows = db.prepare(`
+    SELECT ct.*,
+           co.name AS company_name,
+           (SELECT MAX(o.date) FROM outreach o WHERE o.contact_id = ct.id) AS last_touch
+    FROM contacts ct
+    LEFT JOIN companies co ON ct.company_id = co.id
+    ORDER BY ct.name ASC
+  `).all();
+  res.json(rows.map(rowToContact));
+});
+
 app.post('/api/contacts', (req, res) => {
   const { name, companyId, title, warmth } = req.body;
   if (!name || !warmth) return res.status(400).json({ error: 'name and warmth are required' });
@@ -131,15 +184,25 @@ app.post('/api/contacts', (req, res) => {
 
 app.patch('/api/contacts/:id', (req, res) => {
   const { id } = req.params;
-  const { name, title, warmth } = req.body;
+  const { name, title, warmth, status, nextAction, nextTouch } = req.body;
 
   const result = db.prepare(`
-    UPDATE contacts SET name = ?, title = ?, warmth = ? WHERE id = ?
-  `).run(name, title ?? null, warmth, id);
+    UPDATE contacts
+    SET name = ?, title = ?, warmth = ?,
+        status = COALESCE(?, status),
+        next_action = COALESCE(?, next_action),
+        next_touch = COALESCE(?, next_touch)
+    WHERE id = ?
+  `).run(name, title ?? null, warmth, status ?? null, nextAction ?? null, nextTouch ?? null, id);
 
   if (result.changes === 0) return res.status(404).json({ error: 'Contact not found' });
 
-  const row = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
+  const row = db.prepare(`
+    SELECT ct.*, co.name AS company_name,
+           (SELECT MAX(o.date) FROM outreach o WHERE o.contact_id = ct.id) AS last_touch
+    FROM contacts ct LEFT JOIN companies co ON ct.company_id = co.id
+    WHERE ct.id = ?
+  `).get(id);
   res.status(200).json(rowToContact(row));
 });
 
@@ -259,6 +322,88 @@ app.delete('/api/outreach/:id', (req, res) => {
   res.json({ deleted: true });
 });
 
+// GET all outreach (for Outreach tab)
+app.get('/api/outreach', (req, res) => {
+  const rows = db.prepare(`
+    SELECT o.*,
+           ct.name AS contact_name,
+           co.name AS company_name
+    FROM outreach o
+    LEFT JOIN contacts ct ON o.contact_id = ct.id
+    LEFT JOIN companies co ON o.company_id = co.id
+    ORDER BY o.date DESC, o.created_at DESC
+  `).all();
+  res.json(rows.map(rowToOutreach));
+});
+
+// POST new outreach (body-based, for Outreach tab)
+const VALID_ACTIONS = [
+  'Cold Outreach', 'Warm Outreach', 'Follow-Up', 'Intro Request',
+  'Meeting Booked', 'Meeting Held', 'Thank You Sent',
+  'Intro Made', 'Referral Offered', 'Referral Submitted',
+];
+
+app.post('/api/outreach', (req, res) => {
+  const { contactId, date, action, notes, result: resultText } = req.body;
+  if (!contactId || !date) {
+    return res.status(400).json({ error: 'contactId and date are required' });
+  }
+
+  const contact = db.prepare('SELECT id, company_id FROM contacts WHERE id = ?').get(contactId);
+  if (!contact) return res.status(404).json({ error: 'Contact not found' });
+
+  const companyId = contact.company_id ?? null;
+
+  const dbResult = db.prepare(`
+    INSERT INTO outreach (contact_id, company_id, date, type, action, notes, result)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(contactId, companyId, date, action ?? '', action ?? null, notes ?? null, resultText ?? null);
+
+  const row = db.prepare(`
+    SELECT o.*, ct.name AS contact_name, co.name AS company_name
+    FROM outreach o
+    LEFT JOIN contacts ct ON o.contact_id = ct.id
+    LEFT JOIN companies co ON o.company_id = co.id
+    WHERE o.id = ?
+  `).get(dbResult.lastInsertRowid);
+  res.status(201).json(rowToOutreach(row));
+});
+
+// PATCH outreach entry
+app.patch('/api/outreach/:id', (req, res) => {
+  const { date, action, notes, result: resultText, contactId } = req.body;
+  const id = Number(req.params.id);
+
+  // If contactId is changing, re-derive company_id
+  let companyIdClause = '';
+  const params = [];
+
+  if (contactId !== undefined) {
+    const contact = db.prepare('SELECT id, company_id FROM contacts WHERE id = ?').get(contactId);
+    if (!contact) return res.status(400).json({ error: 'Contact not found' });
+    companyIdClause = ', contact_id = ?, company_id = ?';
+    params.push(contactId, contact.company_id ?? null);
+  }
+
+  const dbResult = db.prepare(`
+    UPDATE outreach
+    SET date = ?, action = ?, type = ?, notes = ?, result = ?
+    ${companyIdClause}
+    WHERE id = ?
+  `).run(date, action ?? null, action ?? null, notes ?? null, resultText ?? null, ...params, id);
+
+  if (dbResult.changes === 0) return res.status(404).json({ error: 'Outreach not found' });
+
+  const row = db.prepare(`
+    SELECT o.*, ct.name AS contact_name, co.name AS company_name
+    FROM outreach o
+    LEFT JOIN contacts ct ON o.contact_id = ct.id
+    LEFT JOIN companies co ON o.company_id = co.id
+    WHERE o.id = ?
+  `).get(id);
+  res.json(rowToOutreach(row));
+});
+
 // --- Research endpoint ---
 
 app.post('/api/companies/:id/research', async (req, res) => {
@@ -322,6 +467,269 @@ Be specific and cite concrete details from your searches. If a search returns li
     res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
     res.end();
   }
+});
+
+// --- Greenhouse job fetcher ---
+
+async function fetchGreenhouseJobs() {
+  const companies = db.prepare(
+    'SELECT id, name, greenhouse_slug FROM companies WHERE greenhouse_slug IS NOT NULL'
+  ).all();
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+
+  for (const company of companies) {
+    const url = `https://boards-api.greenhouse.io/v1/boards/${company.greenhouse_slug}/jobs?content=true`;
+    let jobs;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const data = await res.json();
+      jobs = data.jobs ?? [];
+    } catch { continue; }
+
+    const fetchedIds = new Set();
+
+    for (const job of jobs) {
+      const id = `${company.id}:${job.id}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify(
+        (job.departments ?? []).map((d) => d.name).filter(Boolean)
+      );
+      const ghFirstPublished = job.first_published ?? null;
+      const existing = db.prepare('SELECT id FROM job_postings WHERE id = ?').get(id);
+      if (existing) {
+        db.prepare(
+          "UPDATE job_postings SET last_seen_at = ?, status = 'active', is_new = 0, gh_first_published = COALESCE(gh_first_published, ?) WHERE id = ?"
+        ).run(now, ghFirstPublished, id);
+      } else {
+        db.prepare(`
+          INSERT INTO job_postings
+            (id, company_id, greenhouse_id, title, location, departments, url, is_new, first_seen_at, last_seen_at, gh_first_published)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        `).run(id, company.id, job.id, job.title, job.location?.name ?? null, departments, job.absolute_url, now, now, ghFirstPublished);
+        totalNew++;
+      }
+      totalFound++;
+    }
+
+    // Mark jobs no longer in the feed as closed
+    const activeForCompany = db.prepare(
+      "SELECT id FROM job_postings WHERE company_id = ? AND status = 'active'"
+    ).all(company.id);
+    for (const row of activeForCompany) {
+      if (!fetchedIds.has(row.id)) {
+        db.prepare(
+          "UPDATE job_postings SET status = 'closed', closed_at = ? WHERE id = ?"
+        ).run(now, row.id);
+        totalClosed++;
+      }
+    }
+  }
+
+  db.prepare(`
+    INSERT INTO fetch_runs (run_at, companies_count, jobs_found, new_jobs, closed_jobs)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(now, companies.length, totalFound, totalNew, totalClosed);
+
+  console.log(`[Greenhouse] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed };
+}
+
+// --- Dynamic cron scheduling ---
+
+function cronExprFromSchedule({ frequency, hour, minute }) {
+  const dayExpr = frequency === 'weekdays' ? '1-5' : '*';
+  return `${minute} ${hour} * * ${dayExpr}`;
+}
+
+let currentCronTask = null;
+
+function applySchedule() {
+  if (currentCronTask) currentCronTask.stop();
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'fetch_schedule'").get();
+  const schedule = JSON.parse(row.value);
+  const expr = cronExprFromSchedule(schedule);
+  currentCronTask = cron.schedule(expr, fetchGreenhouseJobs);
+  console.log(`[Greenhouse] Scheduled: ${expr}`);
+}
+
+applySchedule();
+
+// --- Greenhouse job posting endpoints ---
+
+app.get('/api/job-postings', (req, res) => {
+  const { newOnly, companyId, status = 'active' } = req.query;
+  let sql = `
+    SELECT jp.*, c.name AS company_name
+    FROM job_postings jp
+    JOIN companies c ON jp.company_id = c.id
+    WHERE 1=1
+  `;
+  const params = [];
+  if (status !== 'all') { sql += ' AND jp.status = ?'; params.push(status); }
+  if (newOnly === '1') { sql += ' AND jp.is_new = 1'; }
+  if (companyId) { sql += ' AND jp.company_id = ?'; params.push(companyId); }
+  sql += ' ORDER BY jp.first_seen_at DESC';
+  res.json(db.prepare(sql).all(...params));
+});
+
+app.post('/api/job-postings/fetch', async (req, res) => {
+  try {
+    const result = await fetchGreenhouseJobs();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/job-postings/runs', (req, res) => {
+  const rows = db.prepare(
+    'SELECT * FROM fetch_runs ORDER BY id DESC LIMIT 20'
+  ).all();
+  res.json(rows);
+});
+
+app.get('/api/companies/greenhouse', (req, res) => {
+  const rows = db.prepare(
+    'SELECT id, name, greenhouse_slug FROM companies WHERE greenhouse_slug IS NOT NULL ORDER BY name'
+  ).all();
+  res.json(rows);
+});
+
+app.get('/api/settings/fetch-schedule', (req, res) => {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'fetch_schedule'").get();
+  res.json(JSON.parse(row.value));
+});
+
+app.put('/api/settings/fetch-schedule', (req, res) => {
+  const { frequency, hour, minute, savedSearchId = null } = req.body;
+  if (!['daily', 'weekdays'].includes(frequency) ||
+      typeof hour !== 'number' || hour < 0 || hour > 23 ||
+      typeof minute !== 'number' || minute < 0 || minute > 59) {
+    return res.status(400).json({ error: 'Invalid schedule parameters' });
+  }
+  const value = JSON.stringify({ frequency, hour, minute, savedSearchId: savedSearchId ?? null });
+  db.prepare("UPDATE settings SET value = ? WHERE key = 'fetch_schedule'").run(value);
+  applySchedule();
+  res.json({ frequency, hour, minute, savedSearchId: savedSearchId ?? null });
+});
+
+// --- Saved searches ---
+
+app.get('/api/saved-searches', (req, res) => {
+  res.json(db.prepare('SELECT * FROM saved_searches ORDER BY created_at DESC').all());
+});
+
+app.post('/api/saved-searches', (req, res) => {
+  const { name, filters } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'name is required' });
+  const result = db.prepare(
+    'INSERT INTO saved_searches (name, filters) VALUES (?, ?)'
+  ).run(name.trim(), JSON.stringify(filters));
+  const row = db.prepare('SELECT * FROM saved_searches WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json(row);
+});
+
+app.delete('/api/saved-searches/:id', (req, res) => {
+  const id = Number(req.params.id);
+  // Clear schedule reference if this search was selected
+  const schedRow = db.prepare("SELECT value FROM settings WHERE key = 'fetch_schedule'").get();
+  const sched = JSON.parse(schedRow.value);
+  if (sched.savedSearchId === id) {
+    sched.savedSearchId = null;
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'fetch_schedule'").run(JSON.stringify(sched));
+  }
+  db.prepare('DELETE FROM saved_searches WHERE id = ?').run(id);
+  res.json({ deleted: true });
+});
+
+// --- Applications endpoints ---
+
+app.get('/api/applications/posting-ids', (req, res) => {
+  const rows = db.prepare(
+    'SELECT job_posting_id FROM applications WHERE job_posting_id IS NOT NULL'
+  ).all();
+  res.json(rows.map((r) => r.job_posting_id));
+});
+
+app.get('/api/applications', (req, res) => {
+  const rows = db.prepare(`
+    SELECT a.*, jp.url AS job_url
+    FROM applications a
+    LEFT JOIN job_postings jp ON a.job_posting_id = jp.id
+    ORDER BY a.created_at DESC
+  `).all();
+  res.json(rows.map(rowToApplication));
+});
+
+app.post('/api/applications', (req, res) => {
+  const { jobPostingId, companyId, companyName, roleTitle, roleId } = req.body;
+  if (!companyName || !roleTitle) {
+    return res.status(400).json({ error: 'companyName and roleTitle are required' });
+  }
+
+  if (jobPostingId) {
+    const existing = db.prepare(
+      'SELECT id FROM applications WHERE job_posting_id = ?'
+    ).get(jobPostingId);
+    if (existing) {
+      return res.status(409).json({ error: 'Application already exists for this posting', id: existing.id });
+    }
+  }
+
+  const result = db.prepare(`
+    INSERT INTO applications (job_posting_id, company_id, company_name, role_title, role_id, stage)
+    VALUES (?, ?, ?, ?, ?, 'Drafting')
+  `).run(jobPostingId ?? null, companyId ?? null, companyName, roleTitle, roleId ?? null);
+
+  const row = db.prepare(`
+    SELECT a.*, NULL AS job_url FROM applications a WHERE a.id = ?
+  `).get(result.lastInsertRowid);
+  res.status(201).json(rowToApplication(row));
+});
+
+app.patch('/api/applications/:id', (req, res) => {
+  const { id } = req.params;
+  const { roleTitle, roleId, dateApplied, referral, stage, notes } = req.body;
+
+  if (!VALID_STAGES.includes(stage)) {
+    return res.status(400).json({ error: `stage must be one of: ${VALID_STAGES.join(', ')}` });
+  }
+
+  const now = new Date().toISOString();
+  const result = db.prepare(`
+    UPDATE applications
+    SET role_title = ?, role_id = ?, date_applied = ?, referral = ?,
+        stage = ?, notes = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    roleTitle,
+    roleId ?? null,
+    dateApplied ?? null,
+    referral ? 1 : 0,
+    stage,
+    notes ?? null,
+    now,
+    Number(id)
+  );
+
+  if (result.changes === 0) return res.status(404).json({ error: 'Application not found' });
+
+  const row = db.prepare(`
+    SELECT a.*, jp.url AS job_url
+    FROM applications a
+    LEFT JOIN job_postings jp ON a.job_posting_id = jp.id
+    WHERE a.id = ?
+  `).get(Number(id));
+  res.json(rowToApplication(row));
+});
+
+app.delete('/api/applications/:id', (req, res) => {
+  const result = db.prepare('DELETE FROM applications WHERE id = ?').run(Number(req.params.id));
+  if (result.changes === 0) return res.status(404).json({ error: 'Application not found' });
+  res.json({ deleted: true });
 });
 
 app.listen(PORT, () => {

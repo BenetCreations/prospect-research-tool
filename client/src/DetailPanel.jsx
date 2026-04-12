@@ -1,14 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
-
-const OUTREACH_TYPES = [
-  { value: 'email',    label: 'Email' },
-  { value: 'linkedin', label: 'LinkedIn' },
-  { value: 'call',     label: 'Call' },
-  { value: 'meeting',  label: 'Meeting' },
-  { value: 'text',     label: 'Text' },
-];
-
-const today = () => new Date().toISOString().slice(0, 10);
+import { useEffect, useState } from 'react';
 
 const TIERS = ['Tier A', 'Tier B', 'Tier C'];
 
@@ -61,12 +51,6 @@ export default function DetailPanel({ company, onClose, onSave }) {
   const [editingContactId, setEditingContactId] = useState(null);
   const [editValues, setEditValues] = useState({ name: '', title: '', warmth: 2 });
 
-  // Outreach state
-  const [outreachMap, setOutreachMap] = useState({});       // contactId → entry[]
-  const [logFormOpen, setLogFormOpen] = useState(null);     // contactId or null
-  const [logFormData, setLogFormData] = useState({ date: today(), type: 'email', notes: '' });
-  const [outreachSaving, setOutreachSaving] = useState(false);
-
   useEffect(() => {
     if (company) {
       const { interest, fit, access, timing } = company.scores;
@@ -77,29 +61,8 @@ export default function DetailPanel({ company, onClose, onSave }) {
       setAddingContact(false);
       setNewContact({ name: '', title: '', warmth: 2 });
       setEditingContactId(null);
-      setLogFormOpen(null);
-      setOutreachMap({});
     }
   }, [company?.id]);
-
-  // Fetch outreach for all contacts when company changes
-  const fetchOutreach = useCallback(async (contacts, companyId) => {
-    const entries = await Promise.all(
-      contacts.map((ct) =>
-        fetch(`/api/contacts/${ct.id}/outreach?companyId=${companyId}`)
-          .then((r) => r.json())
-          .then((data) => [ct.id, data])
-          .catch(() => [ct.id, []])
-      )
-    );
-    setOutreachMap(Object.fromEntries(entries));
-  }, []);
-
-  useEffect(() => {
-    if (company?.contacts?.length) {
-      fetchOutreach(company.contacts, company.id);
-    }
-  }, [company?.id, company?.contacts, fetchOutreach]);
 
   const total = scores.interest + scores.fit + scores.access + scores.timing;
   const isOpen = company !== null;
@@ -176,43 +139,6 @@ export default function DetailPanel({ company, onClose, onSave }) {
       setContactSaving(false);
     }
   }
-
-  async function handleLogOutreach(e, contactId) {
-    e.preventDefault();
-    setOutreachSaving(true);
-    try {
-      const res = await fetch(`/api/contacts/${contactId}/outreach`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ companyId: company.id, ...logFormData }),
-      });
-      if (!res.ok) throw new Error('Failed to log outreach');
-      const created = await res.json();
-      setOutreachMap((prev) => ({
-        ...prev,
-        [contactId]: [created, ...(prev[contactId] ?? [])],
-      }));
-      setLogFormOpen(null);
-      setLogFormData({ date: today(), type: 'email', notes: '' });
-    } catch {
-      setError('Could not log outreach.');
-    } finally {
-      setOutreachSaving(false);
-    }
-  }
-
-  async function handleDeleteOutreach(contactId, entryId) {
-    try {
-      await fetch(`/api/outreach/${entryId}`, { method: 'DELETE' });
-      setOutreachMap((prev) => ({
-        ...prev,
-        [contactId]: (prev[contactId] ?? []).filter((e) => e.id !== entryId),
-      }));
-    } catch {
-      setError('Could not delete outreach entry.');
-    }
-  }
-
 
   const companyContacts = company?.contacts ?? [];
 
@@ -404,118 +330,28 @@ export default function DetailPanel({ company, onClose, onSave }) {
                         </div>
                       </form>
                     ) : (
-                      <div key={ct.id} className="flex flex-col">
-                        {/* Contact row */}
-                        <div
-                          className="group flex items-start gap-3.5 py-1.5 cursor-pointer"
-                          onClick={() => startEditing(ct)}
-                        >
-                          <span
-                            className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${WARMTH_COLORS[ct.warmth] ?? 'bg-slate-500'}`}
-                            title={WARMTH_LABELS[ct.warmth]}
-                          />
-                          <div className="min-w-0 flex-1">
-                            <p className="text-sm font-medium text-slate-200 leading-snug">{ct.name}</p>
-                            {ct.title && (
-                              <p className="text-xs text-slate-500 leading-snug truncate">{ct.title}</p>
-                            )}
-                          </div>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setLogFormOpen((prev) => prev === ct.id ? null : ct.id);
-                              setLogFormData({ date: today(), type: 'email', notes: '' });
-                            }}
-                            className="text-xs font-medium text-teal-600 hover:text-teal-400 transition-colors shrink-0 px-2.5 py-1 rounded hover:bg-slate-800/60"
-                          >
-                            + Log
-                          </button>
-                          <svg
-                            className="w-4 h-4 text-slate-600 group-hover:text-slate-400 transition-colors shrink-0 mt-0.5 ml-1"
-                            fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                          >
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                              d="M15.232 5.232l3.536 3.536M9 13l6.586-6.586a2 2 0 112.828 2.828L11.828 15.828a2 2 0 01-1.414.586H9v-2a2 2 0 01.586-1.414z" />
-                          </svg>
+                      <div
+                        key={ct.id}
+                        className="group flex items-start gap-3.5 py-1.5 cursor-pointer"
+                        onClick={() => startEditing(ct)}
+                      >
+                        <span
+                          className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${WARMTH_COLORS[ct.warmth] ?? 'bg-slate-500'}`}
+                          title={WARMTH_LABELS[ct.warmth]}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-medium text-slate-200 leading-snug">{ct.name}</p>
+                          {ct.title && (
+                            <p className="text-xs text-slate-500 leading-snug truncate">{ct.title}</p>
+                          )}
                         </div>
-
-                        {/* Outreach log form */}
-                        {logFormOpen === ct.id && (
-                          <form
-                            onSubmit={(e) => handleLogOutreach(e, ct.id)}
-                            className="ml-4 mb-1 flex flex-col gap-2 p-2.5 bg-slate-800/60 rounded-lg border border-slate-700"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <div className="flex gap-2">
-                              <input
-                                type="date"
-                                value={logFormData.date}
-                                onChange={(e) => setLogFormData((p) => ({ ...p, date: e.target.value }))}
-                                required
-                                className="flex-1 text-xs text-slate-200 bg-slate-800 border border-slate-600 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-teal-500"
-                              />
-                              <select
-                                value={logFormData.type}
-                                onChange={(e) => setLogFormData((p) => ({ ...p, type: e.target.value }))}
-                                className="flex-1 text-xs text-slate-200 bg-slate-800 border border-slate-600 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-teal-500"
-                              >
-                                {OUTREACH_TYPES.map((t) => (
-                                  <option key={t.value} value={t.value}>{t.label}</option>
-                                ))}
-                              </select>
-                            </div>
-                            <textarea
-                              value={logFormData.notes}
-                              onChange={(e) => setLogFormData((p) => ({ ...p, notes: e.target.value }))}
-                              placeholder="Notes (optional)"
-                              rows={2}
-                              className="w-full text-xs text-slate-200 placeholder:text-slate-500 bg-slate-800 border border-slate-600 rounded px-2 py-1.5 resize-none focus:outline-none focus:ring-1 focus:ring-teal-500"
-                            />
-                            <div className="flex gap-2">
-                              <button
-                                type="button"
-                                onClick={() => setLogFormOpen(null)}
-                                className="flex-1 text-xs font-medium py-1 rounded border border-slate-600 text-slate-400 hover:bg-slate-700 transition-colors"
-                              >
-                                Cancel
-                              </button>
-                              <button
-                                type="submit"
-                                disabled={outreachSaving}
-                                className="flex-1 text-xs font-medium py-1 rounded bg-teal-600 hover:bg-teal-500 disabled:opacity-50 text-white transition-colors"
-                              >
-                                {outreachSaving ? 'Saving…' : 'Save'}
-                              </button>
-                            </div>
-                          </form>
-                        )}
-
-                        {/* Outreach entries */}
-                        {(outreachMap[ct.id] ?? []).map((entry) => (
-                          <div
-                            key={entry.id}
-                            className="ml-4 flex items-start gap-2 py-0.5 group/entry"
-                          >
-                            <div className="w-1.5 h-1.5 rounded-full bg-slate-600 mt-1.5 shrink-0" />
-                            <div className="flex-1 min-w-0">
-                              <span className="text-xs text-slate-500">
-                                {entry.date}&nbsp;·&nbsp;
-                                <span className="text-slate-400">{OUTREACH_TYPES.find((t) => t.value === entry.type)?.label ?? entry.type}</span>
-                              </span>
-                              {entry.notes && (
-                                <p className="text-xs text-slate-500 truncate">{entry.notes}</p>
-                              )}
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteOutreach(ct.id, entry.id)}
-                              className="text-slate-700 hover:text-red-400 opacity-0 group-hover/entry:opacity-100 transition-all text-xs shrink-0"
-                            >
-                              ×
-                            </button>
-                          </div>
-                        ))}
+                        <svg
+                          className="w-4 h-4 text-slate-600 group-hover:text-slate-400 transition-colors shrink-0 mt-0.5"
+                          fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                            d="M15.232 5.232l3.536 3.536M9 13l6.586-6.586a2 2 0 112.828 2.828L11.828 15.828a2 2 0 01-1.414.586H9v-2a2 2 0 01.586-1.414z" />
+                        </svg>
                       </div>
                     )
                   )}
@@ -546,7 +382,6 @@ export default function DetailPanel({ company, onClose, onSave }) {
                       onChange={(e) => setNewContact((p) => ({ ...p, title: e.target.value }))}
                       className="w-full text-sm text-slate-100 placeholder:text-slate-500 bg-slate-800 border border-slate-600 rounded px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-teal-500"
                     />
-                    {/* Warmth toggle */}
                     <div className="flex gap-1.5">
                       {[1, 2, 3, 4].map((n) => {
                         const s = WARMTH_BUTTON_STYLES[n];

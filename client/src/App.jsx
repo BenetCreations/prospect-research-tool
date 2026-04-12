@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import DetailPanel from './DetailPanel.jsx';
 import AddCompanyModal from './AddCompanyModal.jsx';
 import ResearchBrief from './ResearchBrief.jsx';
+import PostingsWorkspace from './PostingsWorkspace.jsx';
+import ApplicationsWorkspace from './ApplicationsWorkspace.jsx';
+import ContactsWorkspace from './ContactsWorkspace.jsx';
+import OutreachWorkspace from './OutreachWorkspace.jsx';
 
 const TIER_ORDER = { 'Tier A': 0, 'Tier B': 1, 'Tier C': 2 };
 
@@ -299,6 +303,9 @@ export default function App() {
   const csvInputRef = useRef(null);
   const [mainView, setMainView] = useState('dashboard');
   const [researchSelectedId, setResearchSelectedId] = useState(null);
+  const [applications, setApplications] = useState([]);
+  const [contacts, setContacts] = useState([]);
+  const [outreach, setOutreach] = useState([]);
 
   function fetchCompanies() {
     return fetch('/api/companies')
@@ -307,7 +314,40 @@ export default function App() {
       .catch(() => setError('Could not load companies'));
   }
 
-  useEffect(() => { fetchCompanies(); }, []);
+  function fetchApplications() {
+    return fetch('/api/applications')
+      .then((res) => res.json())
+      .then(setApplications)
+      .catch(() => console.error('Could not load applications'));
+  }
+
+  function fetchContacts() {
+    return fetch('/api/contacts')
+      .then((res) => res.json())
+      .then(setContacts)
+      .catch(() => console.error('Could not load contacts'));
+  }
+
+  function fetchOutreach() {
+    return fetch('/api/outreach')
+      .then((res) => res.json())
+      .then(setOutreach)
+      .catch(() => console.error('Could not load outreach'));
+  }
+
+  function handleApplicationCreated(newApp) {
+    setApplications((prev) => [newApp, ...prev]);
+  }
+
+  function handleApplicationUpdated(updated) {
+    setApplications((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+  }
+
+  function handleApplicationDeleted(id) {
+    setApplications((prev) => prev.filter((a) => a.id !== id));
+  }
+
+  useEffect(() => { fetchCompanies(); fetchApplications(); fetchContacts(); fetchOutreach(); }, []);
 
   useEffect(() => {
     setResearchSelectedId((id) => {
@@ -361,6 +401,8 @@ export default function App() {
 
   function handleSave(updated) {
     setCompanies((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    // Keep flat contacts list in sync when contacts are added/edited via DetailPanel
+    fetchContacts();
   }
 
   function handleExport() {
@@ -414,6 +456,46 @@ export default function App() {
                   : 'text-slate-400 hover:text-slate-200'}`}
             >
               Research
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainView('postings')}
+              className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors
+                ${mainView === 'postings'
+                  ? 'bg-slate-950 text-slate-100 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              Postings
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainView('applications')}
+              className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors
+                ${mainView === 'applications'
+                  ? 'bg-slate-950 text-slate-100 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              Applications
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainView('contacts')}
+              className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors
+                ${mainView === 'contacts'
+                  ? 'bg-slate-950 text-slate-100 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              Contacts
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainView('outreach')}
+              className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors
+                ${mainView === 'outreach'
+                  ? 'bg-slate-950 text-slate-100 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              Outreach
             </button>
           </nav>
         </div>
@@ -486,7 +568,7 @@ export default function App() {
             </>
           )}
         </main>
-      ) : (
+      ) : mainView === 'research' ? (
         <div className="flex-1 flex flex-col min-h-0">
           {error ? (
             <p className="text-red-400 px-6 py-4">{error}</p>
@@ -500,6 +582,42 @@ export default function App() {
               )}
             />
           )}
+        </div>
+      ) : mainView === 'postings' ? (
+        <div className="flex-1 flex flex-col min-h-0">
+          <PostingsWorkspace onApplicationCreated={handleApplicationCreated} />
+        </div>
+      ) : mainView === 'contacts' ? (
+        <div className="flex-1 flex flex-col min-h-0">
+          <ContactsWorkspace
+            contacts={contacts}
+            companies={companies}
+            onContactsChange={(updated) => {
+              setContacts(updated);
+              // Re-fetch so lastTouch etc. stay accurate
+              fetchContacts();
+            }}
+          />
+        </div>
+      ) : mainView === 'outreach' ? (
+        <div className="flex-1 flex flex-col min-h-0">
+          <OutreachWorkspace
+            outreach={outreach}
+            contacts={contacts}
+            onOutreachChange={(updated) => {
+              setOutreach(updated);
+              // Refresh contacts so Last Touch column stays current
+              fetchContacts();
+            }}
+          />
+        </div>
+      ) : (
+        <div className="flex-1 flex flex-col min-h-0">
+          <ApplicationsWorkspace
+            applications={applications}
+            onUpdate={handleApplicationUpdated}
+            onDelete={handleApplicationDeleted}
+          />
         </div>
       )}
 
