@@ -1,5 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+const TIMEZONES = [
+  { value: 'America/Los_Angeles', label: 'Pacific (PT)'         },
+  { value: 'America/Denver',      label: 'Mountain (MT)'        },
+  { value: 'America/Phoenix',     label: 'Arizona — no DST'     },
+  { value: 'America/Chicago',     label: 'Central (CT)'         },
+  { value: 'America/New_York',    label: 'Eastern (ET)'         },
+  { value: 'America/Anchorage',   label: 'Alaska (AKT)'         },
+  { value: 'Pacific/Honolulu',    label: 'Hawaii (HT)'          },
+];
+
+function tzShortLabel(tz) {
+  return TIMEZONES.find((t) => t.value === tz)?.label ?? tz;
+}
+
 const SORT_FIELDS = {
   company_name:       (j) => j.company_name?.toLowerCase() ?? '',
   title:              (j) => j.title?.toLowerCase() ?? '',
@@ -179,6 +193,8 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
   const [appliedPostingIds, setAppliedPostingIds] = useState(new Set());
   const [scheduleEdit, setScheduleEdit] = useState(null);
   const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [scheduleSaved, setScheduleSaved] = useState(false);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   const [savedSearches, setSavedSearches] = useState([]);
   const [saveSearchName, setSaveSearchName] = useState('');
   const [savingSearch, setSavingSearch] = useState(false);
@@ -298,11 +314,17 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...scheduleEdit,
+          timezone: scheduleEdit.timezone ?? 'America/Los_Angeles',
           savedSearchId: scheduleEdit.savedSearchId ?? null,
+          emailTo: scheduleEdit.emailTo?.trim() || null,
+          emailSubjectWithJobs: scheduleEdit.emailSubjectWithJobs?.trim() || null,
+          emailSubjectNoJobs: scheduleEdit.emailSubjectNoJobs?.trim() || null,
         }),
       });
       const updated = await res.json();
       setScheduleEdit(updated);
+      setScheduleSaved(true);
+      setTimeout(() => setScheduleSaved(false), 2500);
     } finally {
       setScheduleSaving(false);
     }
@@ -526,9 +548,28 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
 
         {/* Schedule */}
         <div className="p-4 border-b border-slate-800">
-          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Schedule</h3>
+          <button
+            onClick={() => setScheduleOpen((o) => !o)}
+            className="w-full flex items-center justify-between text-xs font-semibold text-slate-500 uppercase tracking-wider mb-0 hover:text-slate-400 transition-colors"
+          >
+            <span>Schedule</span>
+            <svg
+              className={`w-3.5 h-3.5 transition-transform ${scheduleOpen ? 'rotate-180' : ''}`}
+              fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
           {scheduleEdit && (
-            <div className="space-y-3">
+            <p className="text-xs text-slate-500 mt-1.5">
+              {scheduleEdit.frequency === 'weekdays' ? 'Weekdays' : 'Daily'} at {fmtTime(scheduleEdit.hour, scheduleEdit.minute)}
+              {' '}
+              <span className="text-slate-600">{tzShortLabel(scheduleEdit.timezone)}</span>
+              {' · '}next {nextRunLabel(scheduleEdit.frequency, scheduleEdit.hour, scheduleEdit.minute)}
+            </p>
+          )}
+          {scheduleOpen && scheduleEdit && (
+            <div className="space-y-3 mt-3">
               <div>
                 <label className="block text-xs text-slate-400 mb-1">Frequency</label>
                 <select
@@ -548,9 +589,11 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
                     onChange={(e) => setScheduleEdit((s) => ({ ...s, hour: Number(e.target.value) }))}
                     className="w-full text-sm bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-200 focus:outline-none focus:border-teal-500"
                   >
-                    {Array.from({ length: 24 }, (_, i) => (
-                      <option key={i} value={i}>{String(i).padStart(2, '0')}</option>
-                    ))}
+                    {Array.from({ length: 24 }, (_, i) => {
+                      const ampm = i < 12 ? 'AM' : 'PM';
+                      const h = i % 12 === 0 ? 12 : i % 12;
+                      return <option key={i} value={i}>{h} {ampm}</option>;
+                    })}
                   </select>
                 </div>
                 <div className="flex-1">
@@ -565,6 +608,18 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
                     ))}
                   </select>
                 </div>
+              </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Timezone</label>
+                <select
+                  value={scheduleEdit.timezone ?? 'America/Los_Angeles'}
+                  onChange={(e) => setScheduleEdit((s) => ({ ...s, timezone: e.target.value }))}
+                  className="w-full text-sm bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-200 focus:outline-none focus:border-teal-500"
+                >
+                  {TIMEZONES.map((t) => (
+                    <option key={t.value} value={t.value}>{t.label}</option>
+                  ))}
+                </select>
               </div>
               <div>
                 <label className="block text-xs text-slate-400 mb-1">Filter (optional)</label>
@@ -582,17 +637,50 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
                   ))}
                 </select>
               </div>
-              <button
-                onClick={handleSaveSchedule}
-                disabled={scheduleSaving}
-                className="w-full text-sm font-medium px-3 py-1.5 rounded-md
-                  bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-50 transition-colors"
-              >
-                {scheduleSaving ? 'Saving…' : 'Save Schedule'}
-              </button>
-              <p className="text-xs text-slate-600">
-                Next: {nextRunLabel(scheduleEdit.frequency, scheduleEdit.hour, scheduleEdit.minute)}
-              </p>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Email digest to</label>
+                <input
+                  type="email"
+                  placeholder="you@example.com"
+                  value={scheduleEdit.emailTo ?? ''}
+                  onChange={(e) => setScheduleEdit((s) => ({ ...s, emailTo: e.target.value }))}
+                  className="w-full text-sm bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-teal-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Subject — with new jobs</label>
+                <input
+                  type="text"
+                  placeholder="(X) New Job Postings"
+                  value={scheduleEdit.emailSubjectWithJobs ?? ''}
+                  onChange={(e) => setScheduleEdit((s) => ({ ...s, emailSubjectWithJobs: e.target.value }))}
+                  className="w-full text-sm bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-teal-500"
+                />
+                <p className="text-[11px] text-slate-600 mt-1"><span className="text-slate-400 font-mono">(X)</span> is replaced with the posting count (e.g. "(X) New Jobs" → "4 New Jobs")</p>
+              </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Subject — no new jobs</label>
+                <input
+                  type="text"
+                  placeholder="Zero New Job Postings"
+                  value={scheduleEdit.emailSubjectNoJobs ?? ''}
+                  onChange={(e) => setScheduleEdit((s) => ({ ...s, emailSubjectNoJobs: e.target.value }))}
+                  className="w-full text-sm bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-teal-500"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleSaveSchedule}
+                  disabled={scheduleSaving}
+                  className="flex-1 text-sm font-medium px-3 py-1.5 rounded-md
+                    bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-50 transition-colors"
+                >
+                  {scheduleSaving ? 'Saving…' : 'Save Schedule'}
+                </button>
+                {scheduleSaved && (
+                  <span className="text-xs text-teal-400 font-medium">Saved</span>
+                )}
+              </div>
             </div>
           )}
         </div>

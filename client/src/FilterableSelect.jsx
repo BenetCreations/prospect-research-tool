@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 
 /**
  * A filterable combobox dropdown for use in spreadsheet-style rows.
@@ -7,13 +8,14 @@ import { useEffect, useRef, useState } from 'react';
  *   value        – current selected value (string)
  *   options      – array of strings to choose from
  *   onChange     – called with new value when selection changes
- *   onTab        – called when Tab is pressed (after committing selection); used for cell navigation
+ *   onTab        – called with (shiftKey: boolean) when Tab is pressed;
+ *                  the focus move is deferred so React can flush state first
  *   placeholder  – input placeholder text
  *   className    – extra classes on the wrapper div
  *   inputClass   – extra classes on the input element
  *   disabled     – disables the input
  */
-export default function FilterableSelect({
+const FilterableSelect = forwardRef(function FilterableSelect({
   value = '',
   options = [],
   onChange,
@@ -22,13 +24,19 @@ export default function FilterableSelect({
   className = '',
   inputClass = '',
   disabled = false,
-}) {
+}, ref) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [highlighted, setHighlighted] = useState(0);
+  const [dropdownStyle, setDropdownStyle] = useState({});
   const inputRef = useRef(null);
   const listRef = useRef(null);
   const wrapperRef = useRef(null);
+  // Track whether we're committing via Tab so blur doesn't fight us
+  const tabCommittingRef = useRef(false);
+
+  // Expose the inner input element to parent via ref
+  useImperativeHandle(ref, () => inputRef.current);
 
   // Sync display text when value changes externally
   const [displayText, setDisplayText] = useState(value);
@@ -39,43 +47,66 @@ export default function FilterableSelect({
     : options;
 
   // Keep highlighted in bounds
-  useEffect(() => {
-    setHighlighted(0);
-  }, [query]);
+  useEffect(() => { setHighlighted(0); }, [query]);
 
   // Scroll highlighted item into view
   useEffect(() => {
     if (open && listRef.current) {
       const item = listRef.current.children[highlighted];
-      item?.scrollIntoView({ block: 'nearest' });
+      if (item) {
+        const list = listRef.current;
+        const itemTop = item.offsetTop;
+        const itemBottom = itemTop + item.offsetHeight;
+        if (itemTop < list.scrollTop) {
+          list.scrollTop = itemTop;
+        } else if (itemBottom > list.scrollTop + list.clientHeight) {
+          list.scrollTop = itemBottom - list.clientHeight;
+        }
+      }
     }
   }, [highlighted, open]);
 
-  // Close on outside click
+  // Position the portal dropdown below the input
   useEffect(() => {
+    if (open && inputRef.current) {
+      const rect = inputRef.current.getBoundingClientRect();
+      setDropdownStyle({
+        position: 'fixed',
+        top: rect.bottom + 2,
+        left: rect.left,
+        minWidth: rect.width,
+        zIndex: 9999,
+      });
+    }
+  }, [open]);
+
+  // Close on outside click — but skip if tab-committing
+  useEffect(() => {
+    if (!open) return;
     function handleClick(e) {
-      if (wrapperRef.current && !wrapperRef.current.contains(e.target)) {
-        commitAndClose(false);
+      if (tabCommittingRef.current) return;
+      if (
+        wrapperRef.current && !wrapperRef.current.contains(e.target) &&
+        (!listRef.current || !listRef.current.contains(e.target))
+      ) {
+        setDisplayText(value);
+        setQuery('');
+        setOpen(false);
       }
     }
-    if (open) document.addEventListener('mousedown', handleClick);
+    document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [open, displayText, value]);
+  }, [open, value]);
 
-  function commitAndClose(revert = true) {
-    if (revert) setDisplayText(value);
-    setQuery('');
-    setOpen(false);
-  }
-
-  function selectOption(opt) {
+  const selectOption = useCallback((opt) => {
     setDisplayText(opt);
     setQuery('');
     setOpen(false);
     onChange?.(opt);
-  }
+  }, [onChange]);
 
   function handleFocus() {
+    if (tabCommittingRef.current) return;
     setQuery('');
     setDisplayText('');
     setOpen(true);
@@ -85,6 +116,19 @@ export default function FilterableSelect({
     setQuery(e.target.value);
     setDisplayText(e.target.value);
     setOpen(true);
+  }
+
+  function handleBlur() {
+    // If a tab commit is in progress, don't interfere
+    if (tabCommittingRef.current) return;
+    // Small delay to allow mousedown on dropdown items to fire first
+    setTimeout(() => {
+      if (tabCommittingRef.current) return;
+      if (!open) return;
+      setDisplayText(value);
+      setQuery('');
+      setOpen(false);
+    }, 150);
   }
 
   function handleKeyDown(e) {
@@ -100,22 +144,32 @@ export default function FilterableSelect({
         selectOption(filtered[highlighted]);
       }
     } else if (e.key === 'Tab') {
-      // Commit first filtered match (or currently highlighted), then let Tab bubble for cell nav
+      e.preventDefault();
+      tabCommittingRef.current = true;
+
+      // Commit the best match
       const toSelect = filtered[highlighted] ?? filtered[0] ?? null;
       if (toSelect) {
         onChange?.(toSelect);
         setDisplayText(toSelect);
       } else if (displayText && !options.includes(displayText)) {
-        // Free-text not in list — revert to last known good value
         setDisplayText(value);
       }
       setQuery('');
       setOpen(false);
-      onTab?.();
-      // Don't preventDefault — let Tab propagate so focus moves to next cell
+
+      // Defer focus move to after React flushes the state updates above.
+      // requestAnimationFrame ensures the DOM is settled before we move focus.
+      const shiftKey = e.shiftKey;
+      requestAnimationFrame(() => {
+        tabCommittingRef.current = false;
+        onTab?.(shiftKey);
+      });
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      commitAndClose(true);
+      setDisplayText(value);
+      setQuery('');
+      setOpen(false);
       inputRef.current?.blur();
     }
   }
@@ -130,14 +184,16 @@ export default function FilterableSelect({
         disabled={disabled}
         onChange={handleInputChange}
         onFocus={handleFocus}
+        onBlur={handleBlur}
         onKeyDown={handleKeyDown}
         autoComplete="off"
         className={`w-full bg-transparent outline-none ${inputClass}`}
       />
-      {open && filtered.length > 0 && (
+      {open && filtered.length > 0 && createPortal(
         <ul
           ref={listRef}
-          className="absolute z-50 top-full left-0 mt-0.5 w-full min-w-max bg-slate-800 border border-slate-600 rounded shadow-xl max-h-52 overflow-y-auto"
+          style={dropdownStyle}
+          className="min-w-max bg-slate-800 border border-slate-600 rounded shadow-xl max-h-52 overflow-y-auto"
         >
           {filtered.map((opt, i) => (
             <li
@@ -150,8 +206,11 @@ export default function FilterableSelect({
               {opt}
             </li>
           ))}
-        </ul>
+        </ul>,
+        document.body
       )}
     </div>
   );
-}
+});
+
+export default FilterableSelect;

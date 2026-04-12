@@ -56,12 +56,26 @@ const COLS = [
   { key: 'lastTouch',   label: 'Last Touch',  getValue: (ct) => ct.lastTouch ? formatDate(ct.lastTouch) : '' },
   { key: 'nextAction',  label: 'Next Action', getValue: (ct) => ct.nextAction ?? '' },
   { key: 'nextTouch',   label: 'Next Touch',  getValue: (ct) => ct.nextTouch ? formatDate(ct.nextTouch) : '' },
+  { key: null,          label: '',            getValue: () => '' },
 ];
 
-const DEFAULT_WIDTHS = [72, 150, 140, 140, 100, 90, 100, 180, 100];
+const DEFAULT_WIDTHS = [72, 150, 140, 140, 100, 90, 100, 180, 130, 36];
 const CELL_PAD = 28; // px-3 (12px each side) + 4px buffer
 
 const EMPTY_DRAFT = { name: '', companyName: '', title: '', warmth: 'Warm', status: 'Active', nextAction: '', nextTouch: '' };
+
+// Defined outside the component so React sees a stable reference across renders
+// (defining inside would create a new component type each render, causing remounts and focus loss).
+function TD({ colWidths, colIdx, className = '', children }) {
+  return (
+    <td
+      style={{ width: colWidths[colIdx], maxWidth: colWidths[colIdx] }}
+      className={`px-3 py-1.5 overflow-hidden border-r border-slate-800/50 last:border-r-0 ${className}`}
+    >
+      {children}
+    </td>
+  );
+}
 
 export default function ContactsWorkspace({ contacts, companies, onContactsChange }) {
   const [editingId, setEditingId] = useState(null);
@@ -73,10 +87,26 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
   const [colWidths, setColWidths] = useState(DEFAULT_WIDTHS);
 
   const tableRef = useRef(null);
-  const cellRefs = useRef({});
-  const newRefs = useRef({});
+  // Refs for tab navigation: one array per row (new row + editing row)
+  const newRowRefs = useRef([]);
+  const editRowRefs = useRef([]);
 
   const companyNames = companies.map((c) => c.name).sort();
+
+  // ── Cell tab navigation ──────────────────────────────────────────────────
+  function focusCell(refs, currentIdx, shiftKey) {
+    const nextIdx = shiftKey ? currentIdx - 1 : currentIdx + 1;
+    if (nextIdx >= 0 && nextIdx < refs.length) {
+      refs[nextIdx]?.focus();
+    }
+  }
+
+  function handleCellTab(refs, cellIdx, e) {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      focusCell(refs, cellIdx, e.shiftKey);
+    }
+  }
 
   // ── Column resize (drag) ─────────────────────────────────────────────────
   function startResize(e, colIdx) {
@@ -198,7 +228,18 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
   function handleRowBlur(id, e) {
     const next = e.relatedTarget;
     if (next && e.currentTarget.contains(next)) return;
-    saveEdit(id);
+    // Defer save to allow FilterableSelect's requestAnimationFrame focus to land first.
+    // If focus returns into this row within the frame, skip the save.
+    const row = e.currentTarget;
+    requestAnimationFrame(() => {
+      if (row.contains(document.activeElement)) return;
+      saveEdit(id);
+    });
+  }
+
+  async function handleDelete(id) {
+    await fetch(`/api/contacts/${id}`, { method: 'DELETE' });
+    onContactsChange(contacts.filter((c) => c.id !== id));
   }
 
   // ── New row ───────────────────────────────────────────────────────────────
@@ -232,23 +273,30 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
   function handleNewRowBlur(e) {
     const next = e.relatedTarget;
     if (next && e.currentTarget.contains(next)) return;
-    if (newRow.name.trim()) saveNewRow();
+    const row = e.currentTarget;
+    requestAnimationFrame(() => {
+      if (row.contains(document.activeElement)) return;
+      if (newRow.name.trim()) saveNewRow();
+    });
   }
 
   // ── Header cell ──────────────────────────────────────────────────────────
   function ColHeader({ colIdx, sortCol, children }) {
     return (
       <th
-        onClick={() => toggleSort(sortCol)}
+        onClick={sortCol ? () => toggleSort(sortCol) : undefined}
         style={{ width: colWidths[colIdx] }}
-        className="relative px-3 py-2 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider
-          cursor-pointer select-none hover:text-slate-200 whitespace-nowrap overflow-hidden
-          border-r border-slate-700/50 last:border-r-0"
+        className={`relative px-3 py-2 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider
+          select-none whitespace-nowrap overflow-hidden
+          border-r border-slate-700/50 last:border-r-0
+          ${sortCol ? 'cursor-pointer hover:text-slate-200' : ''}`}
       >
-        <span className="mr-3">{children}</span>
-        <span className="opacity-40 text-slate-300">
-          {sortKey === sortCol ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
-        </span>
+        {children && <span className="mr-3">{children}</span>}
+        {sortCol && (
+          <span className="opacity-40 text-slate-300">
+            {sortKey === sortCol ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+          </span>
+        )}
         {/* Resize handle — double-click to autofit */}
         <div
           className="absolute right-0 top-0 h-full w-2 cursor-col-resize z-10 group/handle"
@@ -262,15 +310,6 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
       </th>
     );
   }
-
-  const TD = ({ colIdx, className = '', children }) => (
-    <td
-      style={{ width: colWidths[colIdx], maxWidth: colWidths[colIdx] }}
-      className={`px-3 py-1.5 overflow-hidden border-r border-slate-800/50 last:border-r-0 ${className}`}
-    >
-      {children}
-    </td>
-  );
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -312,9 +351,112 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
               <ColHeader colIdx={6} sortCol="lastTouch">Last Touch</ColHeader>
               <ColHeader colIdx={7} sortCol="nextAction">Next Action</ColHeader>
               <ColHeader colIdx={8} sortCol="nextTouch">Next Touch</ColHeader>
+              <ColHeader colIdx={9} />
             </tr>
           </thead>
           <tbody>
+            {/* New row */}
+            <tr onBlur={handleNewRowBlur} className="border-b border-slate-800/40 bg-slate-900/30">
+              <TD colWidths={colWidths} colIdx={0}><span className="text-xs text-slate-700">new</span></TD>
+
+              <TD colWidths={colWidths} colIdx={1}>
+                <input
+                  ref={(el) => { newRowRefs.current[0] = el; }}
+                  value={newRow.name}
+                  placeholder="Name…"
+                  onChange={(e) => setNewRow((p) => ({ ...p, name: e.target.value }))}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newRow.name.trim()) saveNewRow();
+                    else handleCellTab(newRowRefs.current, 0, e);
+                  }}
+                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50"
+                />
+              </TD>
+
+              <TD colWidths={colWidths} colIdx={2}>
+                <FilterableSelect
+                  ref={(el) => { newRowRefs.current[1] = el; }}
+                  value={newRow.companyName}
+                  options={companyNames}
+                  onChange={(v) => setNewRow((p) => ({ ...p, companyName: v }))}
+                  onTab={(shiftKey) => focusCell(newRowRefs.current, 1, shiftKey)}
+                  placeholder="Company…"
+                  inputClass="text-slate-300 text-sm placeholder:text-slate-700"
+                  className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
+                />
+              </TD>
+
+              <TD colWidths={colWidths} colIdx={3}>
+                <input
+                  ref={(el) => { newRowRefs.current[2] = el; }}
+                  value={newRow.title}
+                  placeholder="Title…"
+                  onChange={(e) => setNewRow((p) => ({ ...p, title: e.target.value }))}
+                  onKeyDown={(e) => handleCellTab(newRowRefs.current, 2, e)}
+                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50"
+                />
+              </TD>
+
+              <TD colWidths={colWidths} colIdx={4}>
+                <FilterableSelect
+                  ref={(el) => { newRowRefs.current[3] = el; }}
+                  value={newRow.warmth}
+                  options={WARMTH_OPTIONS}
+                  onChange={(v) => setNewRow((p) => ({ ...p, warmth: v }))}
+                  onTab={(shiftKey) => focusCell(newRowRefs.current, 3, shiftKey)}
+                  placeholder="Warmth…"
+                  inputClass="text-slate-300 text-sm placeholder:text-slate-700"
+                  className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
+                />
+              </TD>
+
+              <TD colWidths={colWidths} colIdx={5}>
+                <FilterableSelect
+                  ref={(el) => { newRowRefs.current[4] = el; }}
+                  value={newRow.status}
+                  options={STATUS_OPTIONS}
+                  onChange={(v) => setNewRow((p) => ({ ...p, status: v }))}
+                  onTab={(shiftKey) => focusCell(newRowRefs.current, 4, shiftKey)}
+                  placeholder="Status…"
+                  inputClass="text-slate-300 text-sm placeholder:text-slate-700"
+                  className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
+                />
+              </TD>
+
+              <TD colWidths={colWidths} colIdx={6} />
+
+              <TD colWidths={colWidths} colIdx={7}>
+                <input
+                  ref={(el) => { newRowRefs.current[5] = el; }}
+                  value={newRow.nextAction}
+                  placeholder="Next action…"
+                  onChange={(e) => setNewRow((p) => ({ ...p, nextAction: e.target.value }))}
+                  onKeyDown={(e) => handleCellTab(newRowRefs.current, 5, e)}
+                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50 text-xs"
+                />
+              </TD>
+
+              <TD colWidths={colWidths} colIdx={8}>
+                <input
+                  ref={(el) => { newRowRefs.current[6] = el; }}
+                  value={newRow.nextTouch}
+                  placeholder="MM/DD/YY"
+                  onChange={(e) => setNewRow((p) => ({ ...p, nextTouch: e.target.value }))}
+                  onBlur={(e) => {
+                    const parsed = parseDate(e.target.value);
+                    setNewRow((p) => ({ ...p, nextTouch: parsed ? formatDate(parsed) : '' }));
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newRow.name.trim()) saveNewRow();
+                    else handleCellTab(newRowRefs.current, 6, e);
+                  }}
+                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50 text-xs"
+                />
+              </TD>
+
+              <TD colWidths={colWidths} colIdx={9} />
+            </tr>
+
             {sorted.map((ct) => {
               const isEditing = editingId === ct.id;
               return (
@@ -325,15 +467,19 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                   className={`border-b border-slate-800/60 group
                     ${isEditing ? 'bg-slate-800/50' : 'hover:bg-slate-900/60 cursor-pointer'}`}
                 >
-                  <TD colIdx={0}><span className="text-xs text-slate-600 font-mono truncate block">{ct.id}</span></TD>
+                  <TD colWidths={colWidths} colIdx={0}><span className="text-xs text-slate-600 font-mono truncate block">{ct.id}</span></TD>
 
-                  <TD colIdx={1}>
+                  <TD colWidths={colWidths} colIdx={1}>
                     {isEditing ? (
                       <input
-                        ref={(el) => { cellRefs.current[`${ct.id}-0`] = el; }}
+                        ref={(el) => { editRowRefs.current[0] = el; }}
                         value={draft.name}
                         onChange={(e) => setDraft((p) => ({ ...p, name: e.target.value }))}
-                        onKeyDown={(e) => { if (e.key === 'Escape') cancelEdit(); if (e.key === 'Enter') saveEdit(ct.id); }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelEdit();
+                          else if (e.key === 'Enter') saveEdit(ct.id);
+                          else handleCellTab(editRowRefs.current, 0, e);
+                        }}
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 text-slate-100 outline-none focus:ring-1 focus:ring-teal-500"
                         autoFocus
                       />
@@ -342,12 +488,14 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                     )}
                   </TD>
 
-                  <TD colIdx={2}>
+                  <TD colWidths={colWidths} colIdx={2}>
                     {isEditing ? (
                       <FilterableSelect
+                        ref={(el) => { editRowRefs.current[1] = el; }}
                         value={draft.companyName}
                         options={companyNames}
                         onChange={(v) => setDraft((p) => ({ ...p, companyName: v }))}
+                        onTab={(shiftKey) => focusCell(editRowRefs.current, 1, shiftKey)}
                         inputClass="text-slate-100 text-sm"
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 focus-within:ring-1 focus-within:ring-teal-500"
                       />
@@ -356,12 +504,17 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                     )}
                   </TD>
 
-                  <TD colIdx={3}>
+                  <TD colWidths={colWidths} colIdx={3}>
                     {isEditing ? (
                       <input
+                        ref={(el) => { editRowRefs.current[2] = el; }}
                         value={draft.title}
                         onChange={(e) => setDraft((p) => ({ ...p, title: e.target.value }))}
-                        onKeyDown={(e) => { if (e.key === 'Escape') cancelEdit(); if (e.key === 'Enter') saveEdit(ct.id); }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelEdit();
+                          else if (e.key === 'Enter') saveEdit(ct.id);
+                          else handleCellTab(editRowRefs.current, 2, e);
+                        }}
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 text-slate-100 outline-none focus:ring-1 focus:ring-teal-500"
                       />
                     ) : (
@@ -369,12 +522,14 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                     )}
                   </TD>
 
-                  <TD colIdx={4}>
+                  <TD colWidths={colWidths} colIdx={4}>
                     {isEditing ? (
                       <FilterableSelect
+                        ref={(el) => { editRowRefs.current[3] = el; }}
                         value={draft.warmth}
                         options={WARMTH_OPTIONS}
                         onChange={(v) => setDraft((p) => ({ ...p, warmth: v }))}
+                        onTab={(shiftKey) => focusCell(editRowRefs.current, 3, shiftKey)}
                         inputClass="text-slate-100 text-sm"
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 focus-within:ring-1 focus-within:ring-teal-500"
                       />
@@ -385,12 +540,14 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                     )}
                   </TD>
 
-                  <TD colIdx={5}>
+                  <TD colWidths={colWidths} colIdx={5}>
                     {isEditing ? (
                       <FilterableSelect
+                        ref={(el) => { editRowRefs.current[4] = el; }}
                         value={draft.status}
                         options={STATUS_OPTIONS}
                         onChange={(v) => setDraft((p) => ({ ...p, status: v }))}
+                        onTab={(shiftKey) => focusCell(editRowRefs.current, 4, shiftKey)}
                         inputClass="text-slate-100 text-sm"
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 focus-within:ring-1 focus-within:ring-teal-500"
                       />
@@ -401,18 +558,23 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                     )}
                   </TD>
 
-                  <TD colIdx={6}>
+                  <TD colWidths={colWidths} colIdx={6}>
                     <span className="text-slate-500 text-xs truncate block">
                       {ct.lastTouch ? formatDate(ct.lastTouch) : '—'}
                     </span>
                   </TD>
 
-                  <TD colIdx={7}>
+                  <TD colWidths={colWidths} colIdx={7}>
                     {isEditing ? (
                       <input
+                        ref={(el) => { editRowRefs.current[5] = el; }}
                         value={draft.nextAction}
                         onChange={(e) => setDraft((p) => ({ ...p, nextAction: e.target.value }))}
-                        onKeyDown={(e) => { if (e.key === 'Escape') cancelEdit(); if (e.key === 'Enter') saveEdit(ct.id); }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelEdit();
+                          else if (e.key === 'Enter') saveEdit(ct.id);
+                          else handleCellTab(editRowRefs.current, 5, e);
+                        }}
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 text-slate-100 outline-none focus:ring-1 focus:ring-teal-500"
                       />
                     ) : (
@@ -420,9 +582,10 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                     )}
                   </TD>
 
-                  <TD colIdx={8}>
+                  <TD colWidths={colWidths} colIdx={8}>
                     {isEditing ? (
                       <input
+                        ref={(el) => { editRowRefs.current[6] = el; }}
                         value={draft.nextTouch}
                         placeholder="MM/DD/YY"
                         onChange={(e) => setDraft((p) => ({ ...p, nextTouch: e.target.value }))}
@@ -430,7 +593,11 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                           const parsed = parseDate(e.target.value);
                           setDraft((p) => ({ ...p, nextTouch: parsed ? formatDate(parsed) : '' }));
                         }}
-                        onKeyDown={(e) => { if (e.key === 'Escape') cancelEdit(); if (e.key === 'Enter') saveEdit(ct.id); }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelEdit();
+                          else if (e.key === 'Enter') saveEdit(ct.id);
+                          else handleCellTab(editRowRefs.current, 6, e);
+                        }}
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 text-slate-100 outline-none focus:ring-1 focus:ring-teal-500 placeholder:text-slate-600 text-xs"
                       />
                     ) : (
@@ -439,92 +606,18 @@ export default function ContactsWorkspace({ contacts, companies, onContactsChang
                       </span>
                     )}
                   </TD>
+
+                  <TD colWidths={colWidths} colIdx={9} className="px-2 text-right">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleDelete(ct.id); }}
+                      className="text-slate-700 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all text-base leading-none"
+                    >
+                      ×
+                    </button>
+                  </TD>
                 </tr>
               );
             })}
-
-            {/* New row */}
-            <tr onBlur={handleNewRowBlur} className="border-b border-slate-800/40 bg-slate-900/30">
-              <TD colIdx={0}><span className="text-xs text-slate-700">new</span></TD>
-
-              <TD colIdx={1}>
-                <input
-                  ref={(el) => { newRefs.current[0] = el; }}
-                  value={newRow.name}
-                  placeholder="Name…"
-                  onChange={(e) => setNewRow((p) => ({ ...p, name: e.target.value }))}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && newRow.name.trim()) saveNewRow(); }}
-                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50"
-                />
-              </TD>
-
-              <TD colIdx={2}>
-                <FilterableSelect
-                  value={newRow.companyName}
-                  options={companyNames}
-                  onChange={(v) => setNewRow((p) => ({ ...p, companyName: v }))}
-                  placeholder="Company…"
-                  inputClass="text-slate-300 text-sm placeholder:text-slate-700"
-                  className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
-                />
-              </TD>
-
-              <TD colIdx={3}>
-                <input
-                  value={newRow.title}
-                  placeholder="Title…"
-                  onChange={(e) => setNewRow((p) => ({ ...p, title: e.target.value }))}
-                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50"
-                />
-              </TD>
-
-              <TD colIdx={4}>
-                <FilterableSelect
-                  value={newRow.warmth}
-                  options={WARMTH_OPTIONS}
-                  onChange={(v) => setNewRow((p) => ({ ...p, warmth: v }))}
-                  placeholder="Warmth…"
-                  inputClass="text-slate-300 text-sm placeholder:text-slate-700"
-                  className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
-                />
-              </TD>
-
-              <TD colIdx={5}>
-                <FilterableSelect
-                  value={newRow.status}
-                  options={STATUS_OPTIONS}
-                  onChange={(v) => setNewRow((p) => ({ ...p, status: v }))}
-                  placeholder="Status…"
-                  inputClass="text-slate-300 text-sm placeholder:text-slate-700"
-                  className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
-                />
-              </TD>
-
-              <TD colIdx={6} />
-
-              <TD colIdx={7}>
-                <input
-                  value={newRow.nextAction}
-                  placeholder="Next action…"
-                  onChange={(e) => setNewRow((p) => ({ ...p, nextAction: e.target.value }))}
-                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50 text-xs"
-                />
-              </TD>
-
-              <TD colIdx={8}>
-                <input
-                  value={newRow.nextTouch}
-                  placeholder="MM/DD/YY"
-                  onChange={(e) => setNewRow((p) => ({ ...p, nextTouch: e.target.value }))}
-                  onBlur={(e) => {
-                    const parsed = parseDate(e.target.value);
-                    setNewRow((p) => ({ ...p, nextTouch: parsed ? formatDate(parsed) : '' }));
-                  }}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && newRow.name.trim()) saveNewRow(); }}
-                  className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50 text-xs"
-                />
-              </TD>
-            </tr>
           </tbody>
         </table>
       </div>

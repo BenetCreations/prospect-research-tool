@@ -171,7 +171,15 @@ export function initDb() {
   const scheduleExists = db.prepare("SELECT 1 FROM settings WHERE key = 'fetch_schedule'").get();
   if (!scheduleExists) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('fetch_schedule', ?)")
-      .run(JSON.stringify({ frequency: 'daily', hour: 8, minute: 0 }));
+      .run(JSON.stringify({ frequency: 'daily', hour: 8, minute: 0, timezone: 'America/Los_Angeles' }));
+  } else {
+    // Patch existing rows that predate the timezone field
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'fetch_schedule'").get();
+    const val = JSON.parse(row.value);
+    if (!val.timezone) {
+      val.timezone = 'America/Los_Angeles';
+      db.prepare("UPDATE settings SET value = ? WHERE key = 'fetch_schedule'").run(JSON.stringify(val));
+    }
   }
 
   // Seed known Greenhouse slugs

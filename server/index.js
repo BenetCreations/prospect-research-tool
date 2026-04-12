@@ -9,6 +9,7 @@ import express from 'express';
 import cors from 'cors';
 import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
+import nodemailer from 'nodemailer';
 import { db, initDb } from './db/index.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -204,6 +205,14 @@ app.patch('/api/contacts/:id', (req, res) => {
     WHERE ct.id = ?
   `).get(id);
   res.status(200).json(rowToContact(row));
+});
+
+app.delete('/api/contacts/:id', (req, res) => {
+  const { id } = req.params;
+  db.prepare('DELETE FROM outreach WHERE contact_id = ?').run(id);
+  const result = db.prepare('DELETE FROM contacts WHERE id = ?').run(id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Contact not found' });
+  res.status(204).end();
 });
 
 app.post('/api/contacts/import', (req, res) => {
@@ -469,6 +478,89 @@ Be specific and cite concrete details from your searches. If a search returns li
   }
 });
 
+// --- Email digest ---
+
+function fmtDateEmail(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function parseDepts(raw) {
+  if (!raw) return [];
+  try { return JSON.parse(raw); } catch { return []; }
+}
+
+async function sendJobDigestEmail(newJobs) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'fetch_schedule'").get();
+  const schedule = JSON.parse(row.value);
+  const { emailTo, emailSubjectWithJobs, emailSubjectNoJobs } = schedule;
+
+  if (!emailTo || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) return;
+
+  const count = newJobs.length;
+  const subject = count === 0
+    ? (emailSubjectNoJobs?.trim() || 'Zero New Job Postings')
+    : (emailSubjectWithJobs?.trim() || '(X) New Job Postings').replace(/\(X\)/g, String(count));
+
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+  });
+
+  const bodyHtml = count === 0
+    ? `<p style="font-family:sans-serif;color:#64748b;">No new job postings were found in this run.</p>`
+    : `
+      <table style="width:100%;border-collapse:collapse;font-family:sans-serif;font-size:14px;">
+        <thead>
+          <tr style="background:#0f172a;color:#94a3b8;">
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Company</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Title</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Location</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Department</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Published</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">First Seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${newJobs.map((j, i) => `
+            <tr style="background:${i % 2 === 0 ? '#1e293b' : '#0f172a'};">
+              <td style="padding:8px 12px;color:#e2e8f0;border-bottom:1px solid #334155;">${j.company_name ?? '—'}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #334155;">
+                ${j.url
+                  ? `<a href="${j.url}" style="color:#2dd4bf;text-decoration:none;">${j.title}</a>`
+                  : `<span style="color:#e2e8f0;">${j.title}</span>`}
+              </td>
+              <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${j.location ?? '—'}</td>
+              <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${parseDepts(j.departments).join(', ') || '—'}</td>
+              <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${fmtDateEmail(j.gh_first_published)}</td>
+              <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${fmtDateEmail(j.first_seen_at)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+
+  const html = `
+    <div style="background:#020617;padding:24px;min-height:100vh;">
+      <h2 style="font-family:sans-serif;color:#f1f5f9;margin:0 0 16px;">${subject}</h2>
+      ${bodyHtml}
+      <p style="font-family:sans-serif;font-size:12px;color:#475569;margin-top:24px;">
+        Sent by Prospect Research Tool · ${new Date().toLocaleString()}
+      </p>
+    </div>
+  `;
+
+  await transporter.sendMail({
+    from: process.env.EMAIL_USER,
+    to: emailTo,
+    subject,
+    html,
+  });
+
+  console.log(`[Email] Digest sent to ${emailTo}: "${subject}"`);
+}
+
 // --- Greenhouse job fetcher ---
 
 async function fetchGreenhouseJobs() {
@@ -478,6 +570,7 @@ async function fetchGreenhouseJobs() {
 
   const now = new Date().toISOString();
   let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
 
   for (const company of companies) {
     const url = `https://boards-api.greenhouse.io/v1/boards/${company.greenhouse_slug}/jobs?content=true`;
@@ -509,6 +602,16 @@ async function fetchGreenhouseJobs() {
             (id, company_id, greenhouse_id, title, location, departments, url, is_new, first_seen_at, last_seen_at, gh_first_published)
           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
         `).run(id, company.id, job.id, job.title, job.location?.name ?? null, departments, job.absolute_url, now, now, ghFirstPublished);
+        newJobRows.push({
+          id,
+          company_name: company.name,
+          title: job.title,
+          location: job.location?.name ?? null,
+          departments,
+          url: job.absolute_url,
+          gh_first_published: ghFirstPublished,
+          first_seen_at: now,
+        });
         totalNew++;
       }
       totalFound++;
@@ -534,6 +637,10 @@ async function fetchGreenhouseJobs() {
   `).run(now, companies.length, totalFound, totalNew, totalClosed);
 
   console.log(`[Greenhouse] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+
+  // Send email digest (fire-and-forget; errors are logged but don't break the fetch)
+  sendJobDigestEmail(newJobRows).catch((err) => console.error('[Email] Failed to send digest:', err.message));
+
   return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed };
 }
 
@@ -551,8 +658,9 @@ function applySchedule() {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'fetch_schedule'").get();
   const schedule = JSON.parse(row.value);
   const expr = cronExprFromSchedule(schedule);
-  currentCronTask = cron.schedule(expr, fetchGreenhouseJobs);
-  console.log(`[Greenhouse] Scheduled: ${expr}`);
+  const tz = schedule.timezone ?? 'America/Los_Angeles';
+  currentCronTask = cron.schedule(expr, fetchGreenhouseJobs, { timezone: tz });
+  console.log(`[Greenhouse] Scheduled: ${expr} (${tz})`);
 }
 
 applySchedule();
@@ -603,17 +711,32 @@ app.get('/api/settings/fetch-schedule', (req, res) => {
   res.json(JSON.parse(row.value));
 });
 
+const VALID_TIMEZONES = new Set([
+  'America/Los_Angeles', 'America/Denver', 'America/Phoenix',
+  'America/Chicago', 'America/New_York', 'America/Anchorage', 'Pacific/Honolulu',
+]);
+
 app.put('/api/settings/fetch-schedule', (req, res) => {
-  const { frequency, hour, minute, savedSearchId = null } = req.body;
+  const { frequency, hour, minute, timezone = 'America/Los_Angeles', savedSearchId = null, emailTo = null, emailSubjectWithJobs = null, emailSubjectNoJobs = null } = req.body;
   if (!['daily', 'weekdays'].includes(frequency) ||
       typeof hour !== 'number' || hour < 0 || hour > 23 ||
-      typeof minute !== 'number' || minute < 0 || minute > 59) {
+      typeof minute !== 'number' || minute < 0 || minute > 59 ||
+      !VALID_TIMEZONES.has(timezone)) {
     return res.status(400).json({ error: 'Invalid schedule parameters' });
   }
-  const value = JSON.stringify({ frequency, hour, minute, savedSearchId: savedSearchId ?? null });
-  db.prepare("UPDATE settings SET value = ? WHERE key = 'fetch_schedule'").run(value);
+  const payload = {
+    frequency,
+    hour,
+    minute,
+    timezone,
+    savedSearchId: savedSearchId ?? null,
+    emailTo: emailTo?.trim() || null,
+    emailSubjectWithJobs: emailSubjectWithJobs?.trim() || null,
+    emailSubjectNoJobs: emailSubjectNoJobs?.trim() || null,
+  };
+  db.prepare("UPDATE settings SET value = ? WHERE key = 'fetch_schedule'").run(JSON.stringify(payload));
   applySchedule();
-  res.json({ frequency, hour, minute, savedSearchId: savedSearchId ?? null });
+  res.json(payload);
 });
 
 // --- Saved searches ---

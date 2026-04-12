@@ -57,6 +57,17 @@ const CELL_PAD = 28;
 
 const EMPTY_NEW = { date: today(), contactName: '', notes: '', action: '', result: '' };
 
+function TD({ colWidths, colIdx, className = '', children }) {
+  return (
+    <td
+      style={{ width: colWidths[colIdx], maxWidth: colWidths[colIdx] }}
+      className={`px-3 py-1.5 overflow-hidden border-r border-slate-800/50 last:border-r-0 ${className}`}
+    >
+      {children}
+    </td>
+  );
+}
+
 export default function OutreachWorkspace({ outreach, contacts, onOutreachChange }) {
   const [editingId, setEditingId] = useState(null);
   const [draft, setDraft] = useState({});
@@ -67,8 +78,25 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
   const [colWidths, setColWidths] = useState(DEFAULT_WIDTHS);
 
   const tableRef = useRef(null);
+  const newRowRefs = useRef([]);
+  const editRowRefs = useRef([]);
 
   const contactNames = contacts.map((c) => c.name).sort();
+
+  // ── Cell tab navigation ──────────────────────────────────────────────────
+  function focusCell(refs, currentIdx, shiftKey) {
+    const nextIdx = shiftKey ? currentIdx - 1 : currentIdx + 1;
+    if (nextIdx >= 0 && nextIdx < refs.length) {
+      refs[nextIdx]?.focus();
+    }
+  }
+
+  function handleCellTab(refs, cellIdx, e) {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      focusCell(refs, cellIdx, e.shiftKey);
+    }
+  }
 
   // ── Column resize (drag) ─────────────────────────────────────────────────
   function startResize(e, colIdx) {
@@ -183,7 +211,11 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
   function handleRowBlur(id, e) {
     const next = e.relatedTarget;
     if (next && e.currentTarget.contains(next)) return;
-    saveEdit(id);
+    const row = e.currentTarget;
+    requestAnimationFrame(() => {
+      if (row.contains(document.activeElement)) return;
+      saveEdit(id);
+    });
   }
 
   async function handleDelete(id) {
@@ -221,7 +253,11 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
   function handleNewRowBlur(e) {
     const next = e.relatedTarget;
     if (next && e.currentTarget.contains(next)) return;
-    if (newRow.date && newRow.contactName) saveNewRow();
+    const row = e.currentTarget;
+    requestAnimationFrame(() => {
+      if (row.contains(document.activeElement)) return;
+      if (newRow.date && newRow.contactName) saveNewRow();
+    });
   }
 
   // ── Header cell ──────────────────────────────────────────────────────────
@@ -254,14 +290,6 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
     );
   }
 
-  const TD = ({ colIdx, className = '', children }) => (
-    <td
-      style={{ width: colWidths[colIdx], maxWidth: colWidths[colIdx] }}
-      className={`px-3 py-1.5 overflow-hidden border-r border-slate-800/50 last:border-r-0 ${className}`}
-    >
-      {children}
-    </td>
-  );
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -290,10 +318,11 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
           <tbody>
             {/* New row at top */}
             <tr onBlur={handleNewRowBlur} className="border-b border-slate-800/40 bg-slate-900/30">
-              <TD colIdx={0}><span className="text-xs text-slate-700">new</span></TD>
+              <TD colWidths={colWidths} colIdx={0}><span className="text-xs text-slate-700">new</span></TD>
 
-              <TD colIdx={1}>
+              <TD colWidths={colWidths} colIdx={1}>
                 <input
+                  ref={(el) => { newRowRefs.current[0] = el; }}
                   value={newRow.date}
                   placeholder="MM/DD/YY"
                   onChange={(e) => setNewRow((p) => ({ ...p, date: e.target.value }))}
@@ -301,53 +330,66 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                     const parsed = parseDate(e.target.value);
                     setNewRow((p) => ({ ...p, date: parsed ? formatDate(parsed) : e.target.value }));
                   }}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && newRow.contactName) saveNewRow(); }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newRow.contactName) saveNewRow();
+                    else handleCellTab(newRowRefs.current, 0, e);
+                  }}
                   className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50 text-xs"
                 />
               </TD>
 
-              <TD colIdx={2}>
+              <TD colWidths={colWidths} colIdx={2}>
                 <FilterableSelect
+                  ref={(el) => { newRowRefs.current[1] = el; }}
                   value={newRow.contactName}
                   options={contactNames}
                   onChange={(v) => setNewRow((p) => ({ ...p, contactName: v }))}
+                  onTab={(shiftKey) => focusCell(newRowRefs.current, 1, shiftKey)}
                   placeholder="Contact…"
                   inputClass="text-slate-300 text-sm placeholder:text-slate-700"
                   className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
                 />
               </TD>
 
-              <TD colIdx={3}>
+              <TD colWidths={colWidths} colIdx={3}>
                 <input
+                  ref={(el) => { newRowRefs.current[2] = el; }}
                   value={newRow.notes}
                   placeholder="Notes…"
                   onChange={(e) => setNewRow((p) => ({ ...p, notes: e.target.value }))}
+                  onKeyDown={(e) => handleCellTab(newRowRefs.current, 2, e)}
                   className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50 text-xs"
                 />
               </TD>
 
-              <TD colIdx={4}>
+              <TD colWidths={colWidths} colIdx={4}>
                 <FilterableSelect
+                  ref={(el) => { newRowRefs.current[3] = el; }}
                   value={newRow.action}
                   options={ACTION_OPTIONS}
                   onChange={(v) => setNewRow((p) => ({ ...p, action: v }))}
+                  onTab={(shiftKey) => focusCell(newRowRefs.current, 3, shiftKey)}
                   placeholder="Action…"
                   inputClass="text-slate-300 text-sm placeholder:text-slate-700"
                   className="w-full rounded px-2 py-0.5 focus-within:bg-slate-700/50 focus-within:ring-1 focus-within:ring-teal-500/50"
                 />
               </TD>
 
-              <TD colIdx={5}>
+              <TD colWidths={colWidths} colIdx={5}>
                 <input
+                  ref={(el) => { newRowRefs.current[4] = el; }}
                   value={newRow.result}
                   placeholder="Result…"
                   onChange={(e) => setNewRow((p) => ({ ...p, result: e.target.value }))}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && newRow.contactName) saveNewRow(); }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && newRow.contactName) saveNewRow();
+                    else handleCellTab(newRowRefs.current, 4, e);
+                  }}
                   className="w-full bg-transparent rounded px-2 py-0.5 text-slate-300 placeholder:text-slate-700 outline-none focus:bg-slate-700/50 focus:ring-1 focus:ring-teal-500/50 text-xs"
                 />
               </TD>
 
-              <TD colIdx={6} />
+              <TD colWidths={colWidths} colIdx={6} />
             </tr>
 
             {sorted.map((entry) => {
@@ -360,11 +402,12 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                   className={`border-b border-slate-800/60 group
                     ${isEditing ? 'bg-slate-800/50' : 'hover:bg-slate-900/60 cursor-pointer'}`}
                 >
-                  <TD colIdx={0}><span className="text-xs text-slate-600 font-mono">{entry.id}</span></TD>
+                  <TD colWidths={colWidths} colIdx={0}><span className="text-xs text-slate-600 font-mono">{entry.id}</span></TD>
 
-                  <TD colIdx={1}>
+                  <TD colWidths={colWidths} colIdx={1}>
                     {isEditing ? (
                       <input
+                        ref={(el) => { editRowRefs.current[0] = el; }}
                         value={draft.date}
                         placeholder="MM/DD/YY"
                         onChange={(e) => setDraft((p) => ({ ...p, date: e.target.value }))}
@@ -372,7 +415,11 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                           const parsed = parseDate(e.target.value);
                           setDraft((p) => ({ ...p, date: parsed ? formatDate(parsed) : e.target.value }));
                         }}
-                        onKeyDown={(e) => { if (e.key === 'Escape') cancelEdit(); if (e.key === 'Enter') saveEdit(entry.id); }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelEdit();
+                          else if (e.key === 'Enter') saveEdit(entry.id);
+                          else handleCellTab(editRowRefs.current, 0, e);
+                        }}
                         autoFocus
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 text-slate-100 outline-none focus:ring-1 focus:ring-teal-500 text-xs"
                       />
@@ -381,12 +428,14 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                     )}
                   </TD>
 
-                  <TD colIdx={2}>
+                  <TD colWidths={colWidths} colIdx={2}>
                     {isEditing ? (
                       <FilterableSelect
+                        ref={(el) => { editRowRefs.current[1] = el; }}
                         value={draft.contactName}
                         options={contactNames}
                         onChange={(v) => setDraft((p) => ({ ...p, contactName: v }))}
+                        onTab={(shiftKey) => focusCell(editRowRefs.current, 1, shiftKey)}
                         inputClass="text-slate-100 text-sm"
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 focus-within:ring-1 focus-within:ring-teal-500"
                       />
@@ -395,12 +444,17 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                     )}
                   </TD>
 
-                  <TD colIdx={3}>
+                  <TD colWidths={colWidths} colIdx={3}>
                     {isEditing ? (
                       <input
+                        ref={(el) => { editRowRefs.current[2] = el; }}
                         value={draft.notes}
                         onChange={(e) => setDraft((p) => ({ ...p, notes: e.target.value }))}
-                        onKeyDown={(e) => { if (e.key === 'Escape') cancelEdit(); if (e.key === 'Enter') saveEdit(entry.id); }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelEdit();
+                          else if (e.key === 'Enter') saveEdit(entry.id);
+                          else handleCellTab(editRowRefs.current, 2, e);
+                        }}
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 text-slate-100 outline-none focus:ring-1 focus:ring-teal-500 text-xs"
                       />
                     ) : (
@@ -408,12 +462,14 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                     )}
                   </TD>
 
-                  <TD colIdx={4}>
+                  <TD colWidths={colWidths} colIdx={4}>
                     {isEditing ? (
                       <FilterableSelect
+                        ref={(el) => { editRowRefs.current[3] = el; }}
                         value={draft.action}
                         options={ACTION_OPTIONS}
                         onChange={(v) => setDraft((p) => ({ ...p, action: v }))}
+                        onTab={(shiftKey) => focusCell(editRowRefs.current, 3, shiftKey)}
                         inputClass="text-slate-100 text-sm"
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 focus-within:ring-1 focus-within:ring-teal-500"
                       />
@@ -422,12 +478,17 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                     )}
                   </TD>
 
-                  <TD colIdx={5}>
+                  <TD colWidths={colWidths} colIdx={5}>
                     {isEditing ? (
                       <input
+                        ref={(el) => { editRowRefs.current[4] = el; }}
                         value={draft.result}
                         onChange={(e) => setDraft((p) => ({ ...p, result: e.target.value }))}
-                        onKeyDown={(e) => { if (e.key === 'Escape') cancelEdit(); if (e.key === 'Enter') saveEdit(entry.id); }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') cancelEdit();
+                          else if (e.key === 'Enter') saveEdit(entry.id);
+                          else handleCellTab(editRowRefs.current, 4, e);
+                        }}
                         className="w-full bg-slate-700/50 rounded px-2 py-0.5 text-slate-100 outline-none focus:ring-1 focus:ring-teal-500 text-xs"
                       />
                     ) : (
@@ -435,7 +496,7 @@ export default function OutreachWorkspace({ outreach, contacts, onOutreachChange
                     )}
                   </TD>
 
-                  <TD colIdx={6} className="px-2 text-right">
+                  <TD colWidths={colWidths} colIdx={6} className="px-2 text-right">
                     <button
                       onClick={(e) => { e.stopPropagation(); handleDelete(entry.id); }}
                       className="text-slate-700 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all text-base leading-none"

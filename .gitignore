@@ -10,5 +10,6 @@ prospect.db-wal
 # Seed files (contain personal data)
 seed_companies.json
 seed_contacts.json
+seed_data/
 
 .DS_Store
