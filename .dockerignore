@@ -1,0 +1,16 @@
+node_modules
+client/node_modules
+server/node_modules
+client/dist
+.env
+.env.example
+.git
+.claude
+prospect.db
+prospect.db-shm
+prospect.db-wal
+seed_companies.json
+seed_contacts.json
+seed_data
+screenshots
+README.md

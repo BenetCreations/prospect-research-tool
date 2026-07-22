@@ -11,11 +11,22 @@ import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
 import nodemailer from 'nodemailer';
 import { db, initDb } from './db/index.js';
+import {
+  detectAtsForCompany,
+  verifyGreenhouseSlug,
+  verifyAshbySlug,
+  verifyLeverSlug,
+  verifyWorkdayUrl,
+  normalizeSourceInput,
+  parseWorkdayUrl,
+  workdayCxsUrl,
+  extractWorkdayReqId,
+} from './atsDetect.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
@@ -42,6 +53,14 @@ function rowToCompany(row) {
     status:           row.status,
     research:         row.research,
     lastResearchDate: row.last_research_date,
+    hasJobBoard: !!(row.greenhouse_slug || row.ashby_slug || row.lever_slug || row.workday_url || row.custom_source),
+    jobBoard: {
+      greenhouseSlug: row.greenhouse_slug ?? null,
+      ashbySlug:      row.ashby_slug ?? null,
+      leverSlug:      row.lever_slug ?? null,
+      workdayUrl:     row.workday_url ?? null,
+      customSource:   row.custom_source ?? null,
+    },
   };
 }
 
@@ -115,7 +134,7 @@ app.get('/api/companies', (req, res) => {
   res.json(enriched);
 });
 
-app.post('/api/companies', (req, res) => {
+app.post('/api/companies', async (req, res) => {
   const { name, vertical, priorityTier } = req.body;
   if (!name || !vertical || !priorityTier) {
     return res.status(400).json({ error: 'name, vertical, and priorityTier are required' });
@@ -128,8 +147,35 @@ app.post('/api/companies', (req, res) => {
     VALUES (?, ?, ?, ?, 3, 3, 3, 3)
   `).run(id, name, vertical, priorityTier);
 
+  const detection = await detectAtsForCompany(name);
+  const colFor = { greenhouse: 'greenhouse_slug', ashby: 'ashby_slug', lever: 'lever_slug', workday: 'workday_url' };
+  for (const [source, col] of Object.entries(colFor)) {
+    const d = detection[source];
+    if (d.found) db.prepare(`UPDATE companies SET ${col} = ? WHERE id = ?`).run(d.slug ?? d.url, id);
+  }
+
+  const anyFound = Object.values(detection).some((d) => d.found);
+  if (anyFound) {
+    Promise.all([
+      detection.greenhouse.found && fetchGreenhouseJobs(id),
+      detection.ashby.found && fetchAshbyJobs(id),
+      detection.lever.found && fetchLeverJobs(id),
+      detection.workday.found && fetchWorkdayJobs(id),
+    ].filter(Boolean)).catch((err) => console.error('[Detect] scoped fetch failed:', err.message));
+  }
+
   const row = db.prepare('SELECT * FROM companies WHERE id = ?').get(id);
-  res.status(201).json({ ...rowToCompany(row), contacts: [] });
+  res.status(201).json({
+    ...rowToCompany(row),
+    contacts: [],
+    jobBoardDetection: {
+      greenhouse: detection.greenhouse.found,
+      ashby:      detection.ashby.found,
+      lever:      detection.lever.found,
+      workday:    detection.workday.found,
+      anyFound,
+    },
+  });
 });
 
 app.patch('/api/companies/:id', (req, res) => {
@@ -452,9 +498,10 @@ Be specific and cite concrete details from your searches. If a search returns li
     let fullText = '';
 
     const stream = anthropic.messages.stream({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      model: 'claude-opus-4-8',
+      max_tokens: 8000,
+      thinking: { type: 'adaptive' },
+      tools: [{ type: 'web_search_20260209', name: 'web_search' }],
       messages: [{ role: 'user', content: prompt }],
     });
 
@@ -563,10 +610,11 @@ async function sendJobDigestEmail(newJobs) {
 
 // --- Greenhouse job fetcher ---
 
-async function fetchGreenhouseJobs() {
-  const companies = db.prepare(
-    'SELECT id, name, greenhouse_slug FROM companies WHERE greenhouse_slug IS NOT NULL'
-  ).all();
+async function fetchGreenhouseJobs(companyId = null) {
+  let sql = 'SELECT id, name, greenhouse_slug FROM companies WHERE greenhouse_slug IS NOT NULL';
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
 
   const now = new Date().toISOString();
   let totalFound = 0, totalNew = 0, totalClosed = 0;
@@ -631,17 +679,555 @@ async function fetchGreenhouseJobs() {
     }
   }
 
+  console.log(`[Greenhouse] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// --- Ashby job fetcher ---
+
+async function fetchAshbyJobs(companyId = null) {
+  let sql = 'SELECT id, name, ashby_slug FROM companies WHERE ashby_slug IS NOT NULL';
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
+
+  for (const company of companies) {
+    let jobs;
+    try {
+      const res = await fetch('https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          operationName: 'ApiJobBoardWithTeams',
+          variables: { organizationHostedJobsPageName: company.ashby_slug },
+          query: `query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {
+            jobBoard: jobBoardWithTeams(organizationHostedJobsPageName: $organizationHostedJobsPageName) {
+              teams { id name }
+              jobPostings { id title teamId locationName }
+            }
+          }`,
+        }),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const board = data?.data?.jobBoard;
+      const teamsById = Object.fromEntries((board?.teams ?? []).map((t) => [t.id, t.name]));
+      jobs = board?.jobPostings ?? [];
+      jobs = jobs.map((j) => ({ ...j, teamName: teamsById[j.teamId] ?? null }));
+    } catch { continue; }
+
+    const fetchedIds = new Set();
+
+    for (const job of jobs) {
+      const id = `${company.id}:${job.id}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify(job.teamName ? [job.teamName] : []);
+      const publishedDate = null;
+      const url = `https://jobs.ashbyhq.com/${company.ashby_slug}/${job.id}`;
+      const existing = db.prepare('SELECT id FROM job_postings WHERE id = ?').get(id);
+      if (existing) {
+        db.prepare(
+          "UPDATE job_postings SET last_seen_at = ?, status = 'active', is_new = 0, gh_first_published = COALESCE(gh_first_published, ?) WHERE id = ?"
+        ).run(now, publishedDate, id);
+      } else {
+        db.prepare(`
+          INSERT INTO job_postings
+            (id, company_id, greenhouse_id, title, location, departments, url, is_new, first_seen_at, last_seen_at, gh_first_published, source)
+          VALUES (?, ?, 0, ?, ?, ?, ?, 1, ?, ?, ?, 'ashby')
+        `).run(id, company.id, job.title, job.locationName ?? null, departments, url, now, now, publishedDate);
+        newJobRows.push({
+          id,
+          company_name: company.name,
+          title: job.title,
+          location: job.locationName ?? null,
+          departments,
+          url,
+          gh_first_published: publishedDate,
+          first_seen_at: now,
+        });
+        totalNew++;
+      }
+      totalFound++;
+    }
+
+    // Mark jobs no longer in the feed as closed
+    const activeForCompany = db.prepare(
+      "SELECT id FROM job_postings WHERE company_id = ? AND status = 'active'"
+    ).all(company.id);
+    for (const row of activeForCompany) {
+      if (!fetchedIds.has(row.id)) {
+        db.prepare(
+          "UPDATE job_postings SET status = 'closed', closed_at = ? WHERE id = ?"
+        ).run(now, row.id);
+        totalClosed++;
+      }
+    }
+  }
+
+  console.log(`[Ashby] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// --- Lever job fetcher ---
+
+async function fetchLeverJobs(companyId = null) {
+  let sql = 'SELECT id, name, lever_slug FROM companies WHERE lever_slug IS NOT NULL';
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
+
+  for (const company of companies) {
+    let jobs;
+    try {
+      const res = await fetch(`https://api.lever.co/v0/postings/${company.lever_slug}?mode=json`);
+      if (!res.ok) continue;
+      jobs = await res.json();
+      if (!Array.isArray(jobs)) continue;
+    } catch { continue; }
+
+    const fetchedIds = new Set();
+
+    for (const job of jobs) {
+      const id = `${company.id}:${job.id}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify([job.categories?.team].filter(Boolean));
+      const publishedDate = job.createdAt ? new Date(job.createdAt).toISOString() : null;
+      const existing = db.prepare('SELECT id FROM job_postings WHERE id = ?').get(id);
+      if (existing) {
+        db.prepare(
+          "UPDATE job_postings SET last_seen_at = ?, status = 'active', is_new = 0, gh_first_published = COALESCE(gh_first_published, ?) WHERE id = ?"
+        ).run(now, publishedDate, id);
+      } else {
+        db.prepare(`
+          INSERT INTO job_postings
+            (id, company_id, greenhouse_id, title, location, departments, url, is_new, first_seen_at, last_seen_at, gh_first_published, source)
+          VALUES (?, ?, 0, ?, ?, ?, ?, 1, ?, ?, ?, 'lever')
+        `).run(id, company.id, job.text, job.categories?.location ?? null, departments, job.hostedUrl, now, now, publishedDate);
+        newJobRows.push({
+          id,
+          company_name: company.name,
+          title: job.text,
+          location: job.categories?.location ?? null,
+          departments,
+          url: job.hostedUrl,
+          gh_first_published: publishedDate,
+          first_seen_at: now,
+        });
+        totalNew++;
+      }
+      totalFound++;
+    }
+
+    // Mark jobs no longer in the feed as closed
+    const activeForCompany = db.prepare(
+      "SELECT id FROM job_postings WHERE company_id = ? AND status = 'active'"
+    ).all(company.id);
+    for (const row of activeForCompany) {
+      if (!fetchedIds.has(row.id)) {
+        db.prepare(
+          "UPDATE job_postings SET status = 'closed', closed_at = ? WHERE id = ?"
+        ).run(now, row.id);
+        totalClosed++;
+      }
+    }
+  }
+
+  console.log(`[Lever] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// --- Workday job fetcher ---
+
+async function fetchWorkdayJobs(companyId = null) {
+  let sql = 'SELECT id, name, workday_url FROM companies WHERE workday_url IS NOT NULL';
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
+
+  for (const company of companies) {
+    const parsed = parseWorkdayUrl(company.workday_url);
+    if (!parsed) continue;
+
+    const jobs = [];
+    try {
+      const limit = 20, cap = 500;
+      let offset = 0, total = Infinity;
+      while (offset < total && offset < cap) {
+        const res = await fetch(workdayCxsUrl(parsed), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ appliedFacets: {}, limit, offset, searchText: '' }),
+        });
+        if (!res.ok) break;
+        const data = await res.json();
+        // Workday's CXS API only reports an accurate `total` on the first page — later
+        // pages return `total: 0` even though they still contain real, distinct job data.
+        // Lock `total` from the first page so pagination doesn't stop early.
+        if (offset === 0) total = typeof data.total === 'number' ? data.total : 0;
+        jobs.push(...(data.jobPostings ?? []));
+        offset += limit;
+      }
+    } catch { continue; }
+
+    const fetchedIds = new Set();
+
+    for (const job of jobs) {
+      const reqId = extractWorkdayReqId(job.externalPath);
+      if (!reqId) continue;
+      const id = `${company.id}:wd_${reqId}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify([]);
+      const url = `https://${parsed.tenant}.wd${parsed.shard}.myworkdayjobs.com${job.externalPath}`;
+      const existing = db.prepare('SELECT id FROM job_postings WHERE id = ?').get(id);
+      if (existing) {
+        db.prepare(
+          "UPDATE job_postings SET last_seen_at = ?, status = 'active', is_new = 0 WHERE id = ?"
+        ).run(now, id);
+      } else {
+        db.prepare(`
+          INSERT INTO job_postings
+            (id, company_id, greenhouse_id, title, location, departments, url, is_new, first_seen_at, last_seen_at, gh_first_published, source)
+          VALUES (?, ?, 0, ?, ?, ?, ?, 1, ?, ?, NULL, 'workday')
+        `).run(id, company.id, job.title, job.locationsText ?? null, departments, url, now, now);
+        newJobRows.push({
+          id,
+          company_name: company.name,
+          title: job.title,
+          location: job.locationsText ?? null,
+          departments,
+          url,
+          gh_first_published: null,
+          first_seen_at: now,
+        });
+        totalNew++;
+      }
+      totalFound++;
+    }
+
+    // Mark jobs no longer in the feed as closed
+    const activeForCompany = db.prepare(
+      "SELECT id FROM job_postings WHERE company_id = ? AND status = 'active'"
+    ).all(company.id);
+    for (const row of activeForCompany) {
+      if (!fetchedIds.has(row.id)) {
+        db.prepare(
+          "UPDATE job_postings SET status = 'closed', closed_at = ? WHERE id = ?"
+        ).run(now, row.id);
+        totalClosed++;
+      }
+    }
+  }
+
+  console.log(`[Workday] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// --- Custom fetchers ---
+// Bespoke integrations for companies with no supported generic ATS (Greenhouse/Ashby/
+// Lever/Workday) but a discoverable public API behind their own custom careers site.
+
+function closeStaleJobPostings(companyId, fetchedIds, now) {
+  const activeForCompany = db.prepare(
+    "SELECT id FROM job_postings WHERE company_id = ? AND status = 'active'"
+  ).all(companyId);
+  let closed = 0;
+  for (const row of activeForCompany) {
+    if (!fetchedIds.has(row.id)) {
+      db.prepare("UPDATE job_postings SET status = 'closed', closed_at = ? WHERE id = ?").run(now, row.id);
+      closed++;
+    }
+  }
+  return closed;
+}
+
+function upsertCustomJobPosting({ id, companyId, companyName, title, location, departments, url, publishedAt, source, now, newJobRows }) {
+  const existing = db.prepare('SELECT id FROM job_postings WHERE id = ?').get(id);
+  if (existing) {
+    db.prepare(
+      "UPDATE job_postings SET last_seen_at = ?, status = 'active', is_new = 0, gh_first_published = COALESCE(gh_first_published, ?) WHERE id = ?"
+    ).run(now, publishedAt, id);
+    return false;
+  }
+  db.prepare(`
+    INSERT INTO job_postings
+      (id, company_id, greenhouse_id, title, location, departments, url, is_new, first_seen_at, last_seen_at, gh_first_published, source)
+    VALUES (?, ?, 0, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+  `).run(id, companyId, title, location, departments, url, now, now, publishedAt, source);
+  newJobRows.push({ id, company_name: companyName, title, location, departments, url, gh_first_published: publishedAt, first_seen_at: now });
+  return true;
+}
+
+// Amazon's global board has 10,000+ postings — scoped to the "Sales, Advertising, &
+// Account Management" category (covers SDR/BDR/AE roles) rather than syncing everything.
+async function fetchAmazonJobs(companyId = null) {
+  let sql = "SELECT id, name FROM companies WHERE custom_source = 'amazon'";
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
+
+  for (const company of companies) {
+    const jobs = [];
+    try {
+      const limit = 100, cap = 2000;
+      let offset = 0, total = Infinity;
+      while (offset < total && offset < cap) {
+        const res = await fetch(`https://www.amazon.jobs/en/search.json?category%5B%5D=sales-advertising-account-management&offset=${offset}&result_limit=${limit}`);
+        if (!res.ok) break;
+        const data = await res.json();
+        total = typeof data.hits === 'number' ? data.hits : 0;
+        jobs.push(...(data.jobs ?? []));
+        offset += limit;
+      }
+    } catch { continue; }
+
+    const fetchedIds = new Set();
+    for (const job of jobs) {
+      const id = `${company.id}:${job.id}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify([job.job_category].filter(Boolean));
+      const url = `https://www.amazon.jobs${job.job_path}`;
+      const parsedDate = job.posted_date ? new Date(job.posted_date) : null;
+      const publishedAt = parsedDate && !isNaN(parsedDate) ? parsedDate.toISOString() : null;
+      const isNew = upsertCustomJobPosting({
+        id, companyId: company.id, companyName: company.name,
+        title: job.title, location: job.normalized_location ?? null, departments, url,
+        publishedAt, source: 'amazon', now, newJobRows,
+      });
+      if (isNew) totalNew++;
+      totalFound++;
+    }
+
+    totalClosed += closeStaleJobPostings(company.id, fetchedIds, now);
+  }
+
+  console.log(`[Amazon] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// Microsoft's board has ~1,650 postings with no category facet found — scoped via a
+// search query rather than paginating the full unfiltered board (10/page, no larger
+// page size available).
+async function fetchMicrosoftJobs(companyId = null) {
+  let sql = "SELECT id, name FROM companies WHERE custom_source = 'microsoft'";
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
+
+  for (const company of companies) {
+    const jobs = [];
+    try {
+      const pageSize = 10, cap = 500;
+      let start = 0, total = Infinity;
+      while (start < total && start < cap) {
+        const url = `https://apply.careers.microsoft.com/api/pcsx/search?domain=microsoft.com&query=${encodeURIComponent('sales development representative')}&location=&start=${start}`;
+        const res = await fetch(url);
+        if (!res.ok) break;
+        const data = await res.json();
+        total = typeof data.data?.count === 'number' ? data.data.count : 0;
+        const positions = data.data?.positions ?? [];
+        if (!positions.length) break;
+        jobs.push(...positions);
+        start += pageSize;
+      }
+    } catch { continue; }
+
+    const fetchedIds = new Set();
+    for (const job of jobs) {
+      const id = `${company.id}:${job.id}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify([job.department].filter(Boolean));
+      const location = (job.locations ?? []).join('; ') || null;
+      const url = `https://jobs.careers.microsoft.com${job.positionUrl}`;
+      const publishedAt = job.postedTs ? new Date(job.postedTs * 1000).toISOString() : null;
+      const isNew = upsertCustomJobPosting({
+        id, companyId: company.id, companyName: company.name,
+        title: job.name, location, departments, url,
+        publishedAt, source: 'microsoft', now, newJobRows,
+      });
+      if (isNew) totalNew++;
+      totalFound++;
+    }
+
+    totalClosed += closeStaleJobPostings(company.id, fetchedIds, now);
+  }
+
+  console.log(`[Microsoft] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// Rippling's careers search runs on Algolia with a public search-only key (safe to use
+// client-side by design) — small enough (~800 postings) to sync in full.
+async function fetchRipplingJobs(companyId = null) {
+  let sql = "SELECT id, name FROM companies WHERE custom_source = 'rippling'";
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
+
+  const ALGOLIA_APP_ID = '6FNAX3TBEF';
+  const ALGOLIA_API_KEY = '416caa4690f002ff6fe4a2097623640b';
+  const ALGOLIA_INDEX = 'careers_en-US_production';
+
+  for (const company of companies) {
+    const jobs = [];
+    try {
+      const hitsPerPage = 50, cap = 1000;
+      let page = 0, nbPages = Infinity;
+      while (page < nbPages && page * hitsPerPage < cap) {
+        const res = await fetch(`https://${ALGOLIA_APP_ID.toLowerCase()}-dsn.algolia.net/1/indexes/*/queries`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-algolia-api-key': ALGOLIA_API_KEY,
+            'x-algolia-application-id': ALGOLIA_APP_ID,
+          },
+          body: JSON.stringify({ requests: [{ indexName: ALGOLIA_INDEX, query: '', hitsPerPage, page }] }),
+        });
+        if (!res.ok) break;
+        const data = await res.json();
+        const result = data.results?.[0];
+        if (!result) break;
+        nbPages = result.nbPages ?? 0;
+        jobs.push(...(result.hits ?? []));
+        page += 1;
+      }
+    } catch { continue; }
+
+    // Algolia returns one hit per (job, location) pair — dedupe to one row per job
+    const seenJobIds = new Set();
+    const fetchedIds = new Set();
+    for (const job of jobs) {
+      if (seenJobIds.has(job.jobId)) continue;
+      seenJobIds.add(job.jobId);
+
+      const id = `${company.id}:${job.jobId}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify([job.department?.name].filter(Boolean));
+      const location = (job.locationNames ?? []).join('; ') || null;
+      const isNew = upsertCustomJobPosting({
+        id, companyId: company.id, companyName: company.name,
+        title: job.name, location, departments, url: job.url,
+        publishedAt: null, source: 'rippling', now, newJobRows,
+      });
+      if (isNew) totalNew++;
+      totalFound++;
+    }
+
+    totalClosed += closeStaleJobPostings(company.id, fetchedIds, now);
+  }
+
+  console.log(`[Rippling] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// Docusign built a first-party JSON wrapper API in front of their iCIMS board.
+async function fetchDocusignJobs(companyId = null) {
+  let sql = "SELECT id, name FROM companies WHERE custom_source = 'docusign'";
+  const params = [];
+  if (companyId) { sql += ' AND id = ?'; params.push(companyId); }
+  const companies = db.prepare(sql).all(...params);
+
+  const now = new Date().toISOString();
+  let totalFound = 0, totalNew = 0, totalClosed = 0;
+  const newJobRows = [];
+
+  for (const company of companies) {
+    const jobs = [];
+    try {
+      const cap = 30; // pages; Docusign returns ~10/page, board is a few hundred postings
+      let page = 1, totalCount = Infinity;
+      while ((page - 1) * 10 < totalCount && page <= cap) {
+        const res = await fetch(`https://careers.docusign.com/api/jobs?page=${page}&sortBy=relevance&descending=false&internal=false`);
+        if (!res.ok) break;
+        const data = await res.json();
+        totalCount = typeof data.totalCount === 'number' ? data.totalCount : 0;
+        const pageJobs = data.jobs ?? [];
+        if (!pageJobs.length) break;
+        jobs.push(...pageJobs);
+        page += 1;
+      }
+    } catch { continue; }
+
+    const fetchedIds = new Set();
+    for (const row of jobs) {
+      const job = row.data ?? row;
+      if (!job.req_id) continue;
+      const id = `${company.id}:${job.req_id}`;
+      fetchedIds.add(id);
+      const departments = JSON.stringify((job.category ?? []).map((c) => c.trim()).filter(Boolean));
+      const publishedAt = job.posted_date ?? job.create_date ?? null;
+      const isNew = upsertCustomJobPosting({
+        id, companyId: company.id, companyName: company.name,
+        title: job.title, location: job.full_location ?? job.location_name ?? null, departments,
+        url: job.apply_url, publishedAt, source: 'docusign', now, newJobRows,
+      });
+      if (isNew) totalNew++;
+      totalFound++;
+    }
+
+    totalClosed += closeStaleJobPostings(company.id, fetchedIds, now);
+  }
+
+  console.log(`[Docusign] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed, newJobRows };
+}
+
+// --- Combined fetcher ---
+
+async function fetchAllJobs() {
+  const [ghResult, ashbyResult, leverResult, workdayResult, amazonResult, microsoftResult, ripplingResult, docusignResult] = await Promise.all([
+    fetchGreenhouseJobs(),
+    fetchAshbyJobs(),
+    fetchLeverJobs(),
+    fetchWorkdayJobs(),
+    fetchAmazonJobs(),
+    fetchMicrosoftJobs(),
+    fetchRipplingJobs(),
+    fetchDocusignJobs(),
+  ]);
+
+  const results = [ghResult, ashbyResult, leverResult, workdayResult, amazonResult, microsoftResult, ripplingResult, docusignResult];
+  const combined = {
+    companiesCount: results.reduce((sum, r) => sum + r.companiesCount, 0),
+    jobsFound:      results.reduce((sum, r) => sum + r.jobsFound, 0),
+    newJobs:        results.reduce((sum, r) => sum + r.newJobs, 0),
+    closedJobs:     results.reduce((sum, r) => sum + r.closedJobs, 0),
+  };
+
+  const now = new Date().toISOString();
   db.prepare(`
     INSERT INTO fetch_runs (run_at, companies_count, jobs_found, new_jobs, closed_jobs)
     VALUES (?, ?, ?, ?, ?)
-  `).run(now, companies.length, totalFound, totalNew, totalClosed);
+  `).run(now, combined.companiesCount, combined.jobsFound, combined.newJobs, combined.closedJobs);
 
-  console.log(`[Greenhouse] Ran: ${totalFound} active, ${totalNew} new, ${totalClosed} closed`);
+  const allNewRows = results.flatMap((r) => r.newJobRows);
+  sendJobDigestEmail(allNewRows).catch((err) => console.error('[Email] Failed to send digest:', err.message));
 
-  // Send email digest (fire-and-forget; errors are logged but don't break the fetch)
-  sendJobDigestEmail(newJobRows).catch((err) => console.error('[Email] Failed to send digest:', err.message));
-
-  return { companiesCount: companies.length, jobsFound: totalFound, newJobs: totalNew, closedJobs: totalClosed };
+  return combined;
 }
 
 // --- Dynamic cron scheduling ---
@@ -659,8 +1245,8 @@ function applySchedule() {
   const schedule = JSON.parse(row.value);
   const expr = cronExprFromSchedule(schedule);
   const tz = schedule.timezone ?? 'America/Los_Angeles';
-  currentCronTask = cron.schedule(expr, fetchGreenhouseJobs, { timezone: tz });
-  console.log(`[Greenhouse] Scheduled: ${expr} (${tz})`);
+  currentCronTask = cron.schedule(expr, fetchAllJobs, { timezone: tz });
+  console.log(`[Jobs] Scheduled: ${expr} (${tz})`);
 }
 
 applySchedule();
@@ -685,7 +1271,7 @@ app.get('/api/job-postings', (req, res) => {
 
 app.post('/api/job-postings/fetch', async (req, res) => {
   try {
-    const result = await fetchGreenhouseJobs();
+    const result = await fetchAllJobs();
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -700,10 +1286,85 @@ app.get('/api/job-postings/runs', (req, res) => {
 });
 
 app.get('/api/companies/greenhouse', (req, res) => {
-  const rows = db.prepare(
-    'SELECT id, name, greenhouse_slug FROM companies WHERE greenhouse_slug IS NOT NULL ORDER BY name'
-  ).all();
+  const rows = db.prepare(`
+    SELECT id, name, greenhouse_slug, ashby_slug, lever_slug, workday_url, custom_source FROM companies
+    WHERE greenhouse_slug IS NOT NULL OR ashby_slug IS NOT NULL OR lever_slug IS NOT NULL OR workday_url IS NOT NULL OR custom_source IS NOT NULL
+    ORDER BY name
+  `).all();
   res.json(rows);
+});
+
+const JOB_BOARD_SOURCES = ['greenhouse', 'ashby', 'lever', 'workday'];
+const JOB_BOARD_COLUMN = { greenhouse: 'greenhouse_slug', ashby: 'ashby_slug', lever: 'lever_slug', workday: 'workday_url' };
+const JOB_BOARD_VERIFY = { greenhouse: verifyGreenhouseSlug, ashby: verifyAshbySlug, lever: verifyLeverSlug, workday: verifyWorkdayUrl };
+const JOB_BOARD_FETCHER = { greenhouse: fetchGreenhouseJobs, ashby: fetchAshbyJobs, lever: fetchLeverJobs, workday: fetchWorkdayJobs };
+
+app.patch('/api/companies/:id/job-board', async (req, res) => {
+  const { id } = req.params;
+  const { source, value } = req.body;
+  if (!JOB_BOARD_SOURCES.includes(source) || !value?.trim()) {
+    return res.status(400).json({ error: 'source and value are required' });
+  }
+
+  const company = db.prepare('SELECT id FROM companies WHERE id = ?').get(id);
+  if (!company) return res.status(404).json({ error: 'Company not found' });
+
+  const normalized = normalizeSourceInput(source, value);
+  const verify = await JOB_BOARD_VERIFY[source](normalized);
+  if (!verify.ok) {
+    return res.status(422).json({ error: verify.error ?? `Could not find a ${source} job board at that value` });
+  }
+
+  db.prepare(`UPDATE companies SET ${JOB_BOARD_COLUMN[source]} = ? WHERE id = ?`).run(normalized, id);
+
+  let fetchResult = null;
+  try {
+    fetchResult = await JOB_BOARD_FETCHER[source](id);
+  } catch (err) {
+    console.error('[JobBoard] scoped fetch failed:', err.message);
+  }
+
+  const row = db.prepare('SELECT * FROM companies WHERE id = ?').get(id);
+  res.json({ ...rowToCompany(row), jobsFound: fetchResult?.jobsFound ?? null });
+});
+
+// Retroactively detect ATS job boards for companies added before job-board tracking existed
+// (or added without going through the AddCompanyModal auto-detect flow, e.g. CSV import).
+app.post('/api/companies/detect-job-boards', async (req, res) => {
+  const untracked = db.prepare(`
+    SELECT id, name FROM companies
+    WHERE greenhouse_slug IS NULL AND ashby_slug IS NULL AND lever_slug IS NULL AND workday_url IS NULL
+  `).all();
+
+  const results = [];
+  const CONCURRENCY = 3;
+  for (let i = 0; i < untracked.length; i += CONCURRENCY) {
+    const batch = untracked.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(batch.map(async (company) => {
+      const detection = await detectAtsForCompany(company.name);
+      const found = Object.entries(detection).filter(([, d]) => d.found);
+      if (!found.length) return null;
+
+      for (const [source, d] of found) {
+        db.prepare(`UPDATE companies SET ${JOB_BOARD_COLUMN[source]} = ? WHERE id = ?`).run(d.slug ?? d.url, company.id);
+      }
+
+      const fetchResults = await Promise.all(
+        found.map(([source]) => JOB_BOARD_FETCHER[source](company.id).catch(() => null))
+      );
+      const jobsFound = fetchResults.reduce((sum, r) => sum + (r?.jobsFound ?? 0), 0);
+
+      return {
+        id: company.id,
+        name: company.name,
+        sources: found.map(([source, d]) => ({ source, value: d.slug ?? d.url })),
+        jobsFound,
+      };
+    }));
+    results.push(...batchResults.filter(Boolean));
+  }
+
+  res.json({ checked: untracked.length, found: results.length, results });
 });
 
 app.get('/api/settings/fetch-schedule', (req, res) => {
@@ -853,6 +1514,14 @@ app.delete('/api/applications/:id', (req, res) => {
   const result = db.prepare('DELETE FROM applications WHERE id = ?').run(Number(req.params.id));
   if (result.changes === 0) return res.status(404).json({ error: 'Application not found' });
   res.json({ deleted: true });
+});
+
+// Serve the built client in production (client/dist), with SPA fallback for
+// any non-API route so client-side state (e.g. mainView) survives a refresh.
+const clientDist = join(__dirname, '../client/dist');
+app.use(express.static(clientDist));
+app.get(/^(?!\/api).*/, (req, res) => {
+  res.sendFile(join(clientDist, 'index.html'));
 });
 
 app.listen(PORT, () => {
