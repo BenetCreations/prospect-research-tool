@@ -201,6 +201,8 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
   const [fetching, setFetching] = useState(false);
   const [loading, setLoading] = useState(true);
   const [companiesOpen, setCompaniesOpen] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+  const [detectResult, setDetectResult] = useState(null);
 
   // Restore persisted state
   const persisted = useMemo(() => loadLocalState(), []);
@@ -276,6 +278,28 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
       await loadData();
     } finally {
       setFetching(false);
+    }
+  }
+
+  async function handleDetectJobBoards() {
+    setDetecting(true);
+    setDetectResult(null);
+    try {
+      const res = await fetch('/api/companies/detect-job-boards', { method: 'POST' });
+      const data = await res.json();
+      setDetectResult(data);
+      // Newly enabled companies should show up as checked in the filter by default
+      if (data.found > 0) {
+        setEnabledCompanies((prev) => {
+          if (prev === null) return null;
+          const next = new Set(prev);
+          for (const r of data.results) next.add(r.id);
+          return next;
+        });
+        await loadData();
+      }
+    } finally {
+      setDetecting(false);
     }
   }
 
@@ -967,6 +991,37 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
             </div>
           ))}
 
+          {/* Detect job boards for untracked companies */}
+          <div>
+            <button
+              type="button"
+              onClick={handleDetectJobBoards}
+              disabled={detecting}
+              className="w-full flex items-center justify-center gap-1.5 text-xs font-medium py-1.5 rounded-lg border border-slate-700 text-slate-400 hover:border-violet-500/40 hover:text-violet-300 disabled:opacity-50 transition-colors"
+            >
+              {detecting ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  Checking companies…
+                </>
+              ) : (
+                'Detect job boards'
+              )}
+            </button>
+            {detectResult && (
+              <p className="text-[11px] text-slate-500 mt-1.5 leading-snug">
+                {detectResult.found > 0
+                  ? `Found job boards for ${detectResult.found} of ${detectResult.checked} untracked companies: ${detectResult.results.map((r) => r.name).join(', ')}.`
+                  : detectResult.checked > 0
+                  ? `Checked ${detectResult.checked} untracked companies — none matched Greenhouse, Ashby, Lever, or Workday.`
+                  : `All companies already have a job board configured.`}
+              </p>
+            )}
+          </div>
+
           {/* Company filter */}
           <div>
             <button
@@ -1056,13 +1111,8 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
         <div className="flex-1 overflow-auto">
           {loading ? (
             <div className="flex items-center justify-center h-48 text-slate-500 text-sm">Loading…</div>
-          ) : displayedJobs.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-48 gap-2">
-              <p className="text-slate-400 text-sm">No matching postings.</p>
-              <p className="text-slate-600 text-xs">Adjust your filters or click Run Now to fetch jobs.</p>
-            </div>
           ) : (
-            <table className="w-full text-sm border-collapse">
+            <table className="w-full min-w-[860px] text-sm border-collapse">
               <thead className="sticky top-0 bg-slate-900 z-10 border-b border-slate-800">
                 <tr>
                   <SortHeader field="company_name" label="Company" />
@@ -1075,7 +1125,14 @@ export default function PostingsWorkspace({ onApplicationCreated }) {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {displayedJobs.map((job) => {
+                {displayedJobs.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-3 py-12 text-center">
+                      <p className="text-slate-400 text-sm">No matching postings.</p>
+                      <p className="text-slate-600 text-xs mt-1">Adjust your filters or click Run Now to fetch jobs.</p>
+                    </td>
+                  </tr>
+                ) : displayedJobs.map((job) => {
                   const depts = parseDepts(job.departments);
                   return (
                     <tr

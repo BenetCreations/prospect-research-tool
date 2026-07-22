@@ -37,12 +37,25 @@ const SCORE_FIELDS = [
   { key: 'timing',   label: 'Timing'   },
 ];
 
+const JOB_BOARD_SOURCES = [
+  { key: 'greenhouse', label: 'Greenhouse', field: 'greenhouseSlug', placeholder: 'e.g. stripe' },
+  { key: 'ashby',      label: 'Ashby',      field: 'ashbySlug',      placeholder: 'e.g. speak' },
+  { key: 'lever',      label: 'Lever',      field: 'leverSlug',      placeholder: 'e.g. palantir' },
+  { key: 'workday',    label: 'Workday',    field: 'workdayUrl',     placeholder: 'https://{tenant}.wd1.myworkdayjobs.com/{site}' },
+];
+
 export default function DetailPanel({ company, onClose, onSave }) {
   const [scores, setScores] = useState({ interest: 1, fit: 1, access: 1, timing: 1 });
   const [notes, setNotes] = useState('');
   const [tier, setTier] = useState('Tier C');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+
+  // Job board state
+  const [editingSource, setEditingSource] = useState(null);
+  const [jobBoardValue, setJobBoardValue] = useState('');
+  const [jobBoardSaving, setJobBoardSaving] = useState(false);
+  const [jobBoardError, setJobBoardError] = useState(null);
 
   // Contacts state
   const [addingContact, setAddingContact] = useState(false);
@@ -61,6 +74,9 @@ export default function DetailPanel({ company, onClose, onSave }) {
       setAddingContact(false);
       setNewContact({ name: '', title: '', warmth: 2 });
       setEditingContactId(null);
+      setEditingSource(null);
+      setJobBoardValue('');
+      setJobBoardError(null);
     }
   }, [company?.id]);
 
@@ -85,6 +101,34 @@ export default function DetailPanel({ company, onClose, onSave }) {
       setError('Could not save. Is the server running?');
     } finally {
       setSaving(false);
+    }
+  }
+
+  function startEditingSource(source, currentValue) {
+    setEditingSource(source);
+    setJobBoardValue(currentValue ?? '');
+    setJobBoardError(null);
+  }
+
+  async function handleSaveJobBoard(source) {
+    if (!jobBoardValue.trim()) return;
+    setJobBoardSaving(true);
+    setJobBoardError(null);
+    try {
+      const res = await fetch(`/api/companies/${company.id}/job-board`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source, value: jobBoardValue }),
+      });
+      const updated = await res.json();
+      if (!res.ok) throw new Error(updated.error || 'Save failed');
+      onSave({ ...updated, contacts: company.contacts ?? [] });
+      setEditingSource(null);
+      setJobBoardValue('');
+    } catch (e) {
+      setJobBoardError(e.message);
+    } finally {
+      setJobBoardSaving(false);
     }
   }
 
@@ -205,6 +249,72 @@ export default function DetailPanel({ company, onClose, onSave }) {
                       >
                         {t}
                       </button>
+                    );
+                  })}
+                </div>
+              </section>
+
+              {/* Job Board */}
+              <section>
+                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+                  Job Board
+                </h3>
+                <div className="flex flex-col gap-1.5">
+                  {JOB_BOARD_SOURCES.map(({ key, label, field, placeholder }) => {
+                    const value = company.jobBoard?.[field] ?? null;
+                    const isEditing = editingSource === key;
+                    return (
+                      <div key={key} className="text-sm">
+                        {isEditing ? (
+                          <div className="flex flex-col gap-1.5 border border-slate-700 rounded-lg p-2 bg-slate-800/50">
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-medium text-slate-300">{label}</span>
+                              <button
+                                type="button"
+                                onClick={() => { setEditingSource(null); setJobBoardError(null); }}
+                                className="text-xs text-slate-500 hover:text-slate-300"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                            <input
+                              type="text"
+                              value={jobBoardValue}
+                              onChange={(e) => setJobBoardValue(e.target.value)}
+                              placeholder={placeholder}
+                              autoFocus
+                              className="w-full text-xs text-slate-100 placeholder:text-slate-500 border border-slate-600 rounded px-2 py-1.5 bg-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-500"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleSaveJobBoard(key)}
+                              disabled={jobBoardSaving || !jobBoardValue.trim()}
+                              className="text-xs font-medium py-1.5 rounded bg-teal-600 hover:bg-teal-500 disabled:opacity-50 text-white transition-colors"
+                            >
+                              {jobBoardSaving ? 'Verifying…' : 'Verify & Save'}
+                            </button>
+                            {jobBoardError && <p className="text-xs text-red-400">{jobBoardError}</p>}
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <span className="text-slate-300">{label}</span>
+                              {value ? (
+                                <span className="block text-xs text-emerald-400 truncate" title={value}>{value}</span>
+                              ) : (
+                                <span className="block text-xs text-slate-600">Not connected</span>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => startEditingSource(key, value)}
+                              className="shrink-0 text-xs text-slate-400 hover:text-teal-300 transition-colors"
+                            >
+                              {value ? 'Change' : 'Add'}
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     );
                   })}
                 </div>

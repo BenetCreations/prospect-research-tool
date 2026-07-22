@@ -58,8 +58,22 @@ function CompanyCard({ company, onClick }) {
       <div className="p-4 flex flex-col gap-2 flex-1">
         <div className="flex items-start justify-between gap-2">
           <h2 className="text-base font-semibold text-slate-100 leading-tight">{company.name}</h2>
-          <span className={`shrink-0 text-xs font-medium px-2 py-0.5 rounded-full ${styles.badge}`}>
-            {tier}
+          <span className="shrink-0 flex items-center gap-1.5">
+            {!company.hasJobBoard && (
+              <svg
+                className="w-3.5 h-3.5 text-slate-600 shrink-0"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                title="Not tracked in Job Postings — no Greenhouse/Ashby/Lever/Workday board found"
+              >
+                <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                <line x1="6" y1="18" x2="18" y2="6" strokeWidth={2} strokeLinecap="round" />
+              </svg>
+            )}
+            <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${styles.badge}`}>
+              {tier}
+            </span>
           </span>
         </div>
         <p className="text-sm text-slate-400">{company.vertical}</p>
@@ -279,17 +293,21 @@ function parseCSV(text) {
     return fields;
   }
 
-  const headers = parseLine(lines[0]).map((h) => h.toLowerCase());
-  const idx = (key) => headers.indexOf(key);
+  const headers = parseLine(lines[0]).map((h) => h.toLowerCase().trim());
+  const idx = (...keys) => { for (const k of keys) { const i = headers.indexOf(k); if (i !== -1) return i; } return -1; };
+
+  const WARMTH_TEXT = { cold: 1, warm: 2, hot: 3, strong: 4 };
 
   return lines.slice(1).map((line, i) => {
     const f = parseLine(line);
+    const rawWarmth = f[idx('warmth')] ?? '';
+      const warmth = (WARMTH_TEXT[rawWarmth.toLowerCase()] ?? Number(rawWarmth)) || 1;
     return {
-      id: f[idx('id')] || '',
+      id: f[idx('id', 'contact id', 'contact_id')] || '',
       name: f[idx('name')] ?? '',
       company: f[idx('company')] ?? null,
       title: f[idx('title')] ?? null,
-      warmth: Number(f[idx('warmth')]) || 1,
+      warmth,
     };
   }).filter((ct) => ct.name);
 }
