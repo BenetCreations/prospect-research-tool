@@ -533,17 +533,81 @@ function fmtDateEmail(iso) {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+// Mirrors the title-filter matching logic in client/src/PostingsWorkspace.jsx
+// (matchesRule / matchesTitleFilter) so the email digest respects the same
+// saved-search filters used in the Postings tab UI.
+function matchesRule(title, rule) {
+  const t = (title ?? '').toLowerCase();
+  const terms = (rule.value ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!terms.length) return true;
+  if (rule.mode === 'contains') return terms.some((term) => t.includes(term));
+  if (rule.mode === 'starts_with') return terms.some((term) => t.startsWith(term));
+  if (rule.mode === 'excludes') return !terms.some((term) => t.includes(term));
+  return true;
+}
+
+function matchesTitleFilter(title, titleFilter) {
+  const { groups, groupOps } = titleFilter ?? {};
+  if (!groups?.length) return true;
+
+  const groupResults = groups.map((g) => {
+    const activeRules = (g.rules ?? []).filter((r) => r.value?.trim());
+    if (!activeRules.length) return true;
+    const results = activeRules.map((r) => matchesRule(title, r));
+    return g.op === 'ALL' ? results.every(Boolean) : results.some(Boolean);
+  });
+
+  let result = groupResults[0];
+  for (let i = 0; i < (groupOps ?? []).length; i++) {
+    result = groupOps[i] === 'AND'
+      ? result && groupResults[i + 1]
+      : result || groupResults[i + 1];
+  }
+  return result;
+}
+
 function parseDepts(raw) {
   if (!raw) return [];
   try { return JSON.parse(raw); } catch { return []; }
 }
 
+function applySavedSearchFilter(jobs, savedSearchId) {
+  if (!savedSearchId) return jobs;
+  const row = db.prepare('SELECT filters FROM saved_searches WHERE id = ?').get(savedSearchId);
+  if (!row) return jobs;
+
+  let filters;
+  try { filters = JSON.parse(row.filters); } catch { return jobs; }
+
+  let result = jobs;
+
+  if (filters.titleFilter?.groups?.some((g) => g.rules?.some((r) => r.value?.trim()))) {
+    result = result.filter((j) => matchesTitleFilter(j.title, filters.titleFilter));
+  }
+
+  if (filters.location?.trim()) {
+    const locs = filters.location.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    result = result.filter((j) => locs.some((loc) => j.location?.toLowerCase().includes(loc)));
+  }
+
+  if (filters.department?.trim()) {
+    const depts = filters.department.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    result = result.filter((j) =>
+      parseDepts(j.departments).some((d) => depts.some((term) => d.toLowerCase().includes(term)))
+    );
+  }
+
+  return result;
+}
+
 async function sendJobDigestEmail(newJobs) {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'fetch_schedule'").get();
   const schedule = JSON.parse(row.value);
-  const { emailTo, emailSubjectWithJobs, emailSubjectNoJobs } = schedule;
+  const { emailTo, emailSubjectWithJobs, emailSubjectNoJobs, savedSearchId } = schedule;
 
   if (!emailTo || !process.env.EMAIL_USER || !process.env.EMAIL_PASS) return;
+
+  newJobs = applySavedSearchFilter(newJobs, savedSearchId);
 
   const count = newJobs.length;
   const subject = count === 0
@@ -561,17 +625,17 @@ async function sendJobDigestEmail(newJobs) {
       <table style="width:100%;border-collapse:collapse;font-family:sans-serif;font-size:14px;">
         <thead>
           <tr style="background:#0f172a;color:#94a3b8;">
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">#</th>
             <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Company</th>
             <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Title</th>
             <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Location</th>
-            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Department</th>
-            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Published</th>
-            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">First Seen</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid #1e293b;">Date Posted</th>
           </tr>
         </thead>
         <tbody>
           ${newJobs.map((j, i) => `
             <tr style="background:${i % 2 === 0 ? '#1e293b' : '#0f172a'};">
+              <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${i + 1}</td>
               <td style="padding:8px 12px;color:#e2e8f0;border-bottom:1px solid #334155;">${j.company_name ?? '—'}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #334155;">
                 ${j.url
@@ -579,9 +643,7 @@ async function sendJobDigestEmail(newJobs) {
                   : `<span style="color:#e2e8f0;">${j.title}</span>`}
               </td>
               <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${j.location ?? '—'}</td>
-              <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${parseDepts(j.departments).join(', ') || '—'}</td>
               <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${fmtDateEmail(j.gh_first_published)}</td>
-              <td style="padding:8px 12px;color:#94a3b8;border-bottom:1px solid #334155;">${fmtDateEmail(j.first_seen_at)}</td>
             </tr>
           `).join('')}
         </tbody>
